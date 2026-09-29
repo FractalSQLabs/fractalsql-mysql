@@ -1,0 +1,47 @@
+services:
+  mysql:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: demo
+    environment:
+      MYSQL_ROOT_PASSWORD: fractalsql
+      MYSQL_DATABASE: fractalsql_demo
+      FRACTALSQL_REASONING_PLUGIN: /usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
+      FRACTALSQL_HTTP_URL: http://ollama:11434/v1/chat/completions
+      FRACTALSQL_HTTP_ALLOW_PLAINTEXT: "1"
+      FRACTALSQL_HTTP_MODEL: gpt-oss:20b
+      FRACTALSQL_HTTP_EMBED_URL: http://ollama:11434/v1/embeddings
+      FRACTALSQL_HTTP_EMBED_MODEL: nomic-embed-text
+      FSQL_REASONING_HTTP_TIMEOUT_MS: "330000"
+      FSQL_REASONING_HTTP_LOW_SPEED_SECS: "300"
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  pull-model:
+    image: ollama/ollama:latest
+    profiles: ["pull-model"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    entrypoint: ["/bin/sh", "-c", "ollama pull gpt-oss:20b && ollama pull nomic-embed-text"]
+
+volumes:
+  ollama_data:

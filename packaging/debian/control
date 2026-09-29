@@ -1,0 +1,40 @@
+Source: fractalsql-mysql
+Section: database
+Priority: optional
+Maintainer: FractalSQLabs
+Build-Depends:
+ debhelper-compat (= 13),
+ libmysqlclient-dev,
+ pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/FractalSQLabs/fractalsql-mysql
+
+# Reference-only control file: scripts/package.sh (fpm-based) is the
+# actual build/package path used by CI (release.yml, install-test.yml)
+# and documented in scripts/package.sh's own header -- it emits a
+# single generic fractalsql-mysql_<version>_<arch>.deb, not a
+# per-major package, since the UDF ABI is stable across the supported
+# MySQL majors (8.4 LTS / 9.7 LTS / 26.7). This file is kept for maintainers
+# who prefer a native dpkg-buildpackage flow instead of fpm -- it is
+# not exercised by any workflow in this repo.
+Package: fractalsql-mysql
+Architecture: amd64 arm64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libc6 (>= 2.34),
+ libcurl4,
+ mysql-community-server
+Description: Stochastic Fractal Search UDF for MySQL
+ fractalsql-mysql registers the fractal_search() UDF, a Stochastic
+ Fractal Search optimizer that returns JSON top-k matches for a query
+ vector against an inline corpus, plus the full Discovery/Vector/
+ Cognition/Text-to-SQL/Agency/Enterprise-activation tier surface (see
+ docs/features.md). Pure-C vendored core, no LuaJIT runtime
+ dependency. Compatible with MySQL 8.4 LTS / 9.7 LTS / 26.7 -- the UDF ABI has
+ been stable across these majors. The bundled
+ fractalsql-reasoning-http.so plugin (Cognition/Text-to-SQL/
+ Vectorizer/Agency tiers) dynamically links libcurl at runtime, hence
+ the libcurl4 dependency above. mysql-community-server is the Oracle
+ repo's package (repo.mysql.com); Debian's own archive has not carried
+ a current MySQL server major since 8.0 went EOL.

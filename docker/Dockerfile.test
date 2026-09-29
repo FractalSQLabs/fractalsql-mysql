@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1.7
+#
+# fractalsql-mysql test image: runs build_test.sh's gate matrix for
+# ONE MySQL major inside the official mysql:<major> image. A successful
+# `docker build` IS the test result: gates run as a RUN step, so a
+# gate failure fails the build with a non-zero exit and the log in the
+# build output. Base image family and majors in the matrix (8.4 LTS,
+# 9.7 LTS via the `mysql:9` tag, and 26.7 via the `mysql:26` tag).
+#
+# Usage (single major):
+#   docker build -f docker/Dockerfile.test --build-arg MYSQL_MAJOR=8.4 \
+#       -t fractalsql-mysql-test:mysql8.4 .
+#
+# Usage (all majors): see run_build_test.sh at the repo root, which
+# drives this Dockerfile once per major in the compat matrix.
+#
+# Why the official image and not oraclelinux:9 + mysql-community-server:
+# the gate matrix's value comes from testing the EXACT server binaries
+# users run (`mysql:8.4` / `mysql:9` / `mysql:26` are the images Oracle
+# publishes),
+# and the official image ships `mysql_config` in /usr/bin. What it does
+# NOT ship is the C headers (mysql.h et al.) -- they live in
+# mysql-community-devel, and INSTALLING that rpm fails: it conflicts
+# with the image's mysql-community-server-minimal package (both ship
+# /usr/bin/mysql_config and the client-plugins files). So the headers
+# are extracted straight out of the same-version devel rpm (rpm2cpio |
+# cpio), never installed: no rpmdb entry, no package conflict, and
+# `mysql_config --cflags` (already in the image, pointing at
+# /usr/include/mysql) resolves once the headers land there. The rpm
+# version is derived at build time from the running image's OWN
+# mysqld --version, so the headers always match the server being
+# tested, whichever patch release the rolling tag has advanced to.
+
+ARG MYSQL_MAJOR=8.4
+ARG FSQL_TEST_TIMEOUT_MULT=1
+# "" (default) | "asan" | "ubsan": passed through to build_test.sh as
+# --asan/--ubsan.
+ARG FSQL_SAN_MODE=""
+FROM mysql:${MYSQL_MAJOR}
+ARG MYSQL_MAJOR
+ARG FSQL_TEST_TIMEOUT_MULT
+ARG FSQL_SAN_MODE
+
+USER root
+# Toolchain from the image's Oracle Linux 9 repos (this image is
+# OL-based with microdnf, not Debian):
+#   gcc/binutils/file        UDF compile + .so posture checks
+#   openssl-devel            src/fractalsql_enterprise.c's Ed25519
+#                            (openssl/evp.h)
+#   libcurl                  runtime lib for the vendored
+#                            fractalsql-reasoning-http.so (dlopen'd by
+#                            the reasoning-tier gates; without it the
+#                            failure is an invisible NULL return)
+#   python3                  scripts/ci/mock_llm.py, the reasoning-tier
+#                            gates' deterministic HTTP stub
+#   jq                       build_test.sh's JSON assertions
+#   curl/cpio                the header extraction below
+#   procps-ng                pkill/pgrep for build_test.sh's teardown
+#                            and crash-recovery helpers (official
+#                            Debian-based server images ship these,
+#                            this image does not, and the fallback
+#                            respawn-loop helper kills mysqld with
+#                            pkill -f)
+#   libasan/libubsan         -fsanitize runtimes for the FSQL_SAN_MODE
+#                            cells (weak deps are suppressed below, so
+#                            these are listed explicitly)
+RUN microdnf install -y --setopt=install_weak_deps=0 \
+        gcc gcc-c++ make binutils file \
+        openssl-devel \
+        libcurl \
+        python3 \
+        jq \
+        curl cpio \
+        procps-ng \
+        libasan libubsan \
+ && microdnf clean all
+
+# Extract (not install) the same-version mysql-community-devel rpm's
+# C headers into /usr/include/mysql. The extraction lives in
+# docker/extract-headers.sh, invoked as a script file: the rpm
+# filename is looked up in the repo's directory listing because the
+# release-number component ("mysql-community-devel-8.4.11-<REL>.el9
+# .x86_64.rpm") is not derivable from the server version alone, and a
+# script file keeps every shell variable in it out of reach of
+# Dockerfile variable substitution. Verified live against both repo
+# paths; the script's case picks the line from the server's own
+# version string, so the same script serves every matrix cell.
+COPY docker/extract-headers.sh /usr/local/bin/extract-headers.sh
+RUN bash /usr/local/bin/extract-headers.sh
+
+WORKDIR /build
+COPY . /build
+RUN chown -R mysql:mysql /build
+
+# build_test.sh's setup runs mysqld --initialize-insecure and the
+# server itself, both of which refuse to run as root, so the
+# gates run as the `mysql` user (present in the official image).
+USER mysql
+ENV MYSQL_MAJOR=${MYSQL_MAJOR}
+ENV FSQL_TEST_TIMEOUT_MULT=${FSQL_TEST_TIMEOUT_MULT}
+
+RUN chmod +x build_test.sh \
+ && ./build_test.sh --mysql ${MYSQL_MAJOR} \
+      $(case "${FSQL_SAN_MODE}" in asan) echo --asan ;; ubsan) echo --ubsan ;; esac)

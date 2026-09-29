@@ -1,0 +1,982 @@
+name: Install test (packaging)
+
+# End-to-end validation of the shipped .deb and .rpm packages.
+# Builds the artifacts, then installs them inside clean Debian/Ubuntu
+# and RHEL/Rocky containers, starts a real mysqld, loads the UDFs +
+# agent procedures, and exercises fractal_search, its params-bounds
+# caps, and a reasoning round-trip against a mock OpenAI-compatible
+# endpoint.
+#
+# Catches regressions the release.yml metadata verifiers can't —
+# per-distro plugin_dir drift, missing dependency, systemd-init-only
+# plugin activation, etc. Runs on every push + PR (same cadence as
+# CodeQL) so packaging bugs surface before merge, not at tag time.
+#
+# The .deb/.rpm cells install MySQL 8.4 LTS (the recommended server);
+# the 9.7 and 26.7 lines are covered by release.yml's mysql:9
+# and mysql:26 smoke containers, which exercise the same UDF-ABI
+# surface the packages ship.
+#
+# The macOS job covers the Homebrew install path end-to-end, which
+# doesn't fit the container model. The easy-install-* jobs exercise
+# scripts/easy_install.sh / scripts/windows/easy_install.ps1's wizard
+# flows end-to-end, non-interactively against the mock LLM: the Linux
+# one deliberately runs in a non-systemd container so the wizard's
+# direct-mysqld restart fallback is what gets exercised, the macOS one
+# is provider-skip only (launchd restart automation isn't scripted), and
+# the Windows one registers a real mysqld Windows Service so the
+# wizard's service auto-detection + service-environment restart path
+# runs against a real server.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '13 4 * * *'  # nightly safety net
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # Stage 1: build the .so + .deb + .rpm once (amd64 only for speed),
+  # share the artifacts with the install-test jobs below.
+  # arm64 is covered by release.yml's link-step assertions — no value
+  # add to re-run the whole pipeline here just for cross-arch.
+  # ------------------------------------------------------------------
+  build-artifacts:
+    name: Build .so + .deb + .rpm (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Build fractalsql.so
+        run: |
+          chmod +x build.sh
+          ./build.sh amd64
+
+      - name: Install fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Package .deb and .rpm
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh amd64
+
+      - run: ls -l dist/packages
+
+      - name: Upload packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages/*
+          retention-days: 1
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Stage 2a: Debian/Ubuntu install test.
+  # Spins a fresh ubuntu:24.04 container, wires in Oracle's MySQL apt
+  # repo (Ubuntu's own repos stopped carrying a current MySQL server
+  # major when 8.0 went EOL — and our .deb Depends on
+  # mysql-community-server, the Oracle repo's package), installs the
+  # server, installs our .deb with dpkg, starts mysqld without
+  # systemd, registers the UDFs, and verifies edition + version
+  # queries return the expected strings.
+  # ------------------------------------------------------------------
+  debian-install:
+    name: Debian — install + CREATE FUNCTION
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for sql/*.sql + scripts/ci/mock_llm.py)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+
+      - name: Install + verify in ubuntu:24.04
+        run: |
+          # The script runs inside the container against the
+          # workspace mount so it can reach both the .deb and the
+          # install SQL files.
+          cat > test-deb.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y wget gnupg lsb-release ca-certificates
+
+          # Oracle's official apt config package. debconf's default
+          # channel is the current LTS; pin mysql-8.4-lts explicitly so
+          # a future mysql-apt-config default drift can't flip this cell.
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+              | debconf-set-selections
+          dpkg -i mysql-apt-config_0.8.35-1_all.deb
+          apt-get update -qq
+          apt-get install -qq -y mysql-community-server
+
+          # Containers don't run systemd; bring mysqld up directly.
+          mkdir -p /var/run/mysqld
+          chown mysql:mysql /var/run/mysqld
+
+          # Reasoning env must be in mysqld's environment before it
+          # starts: fractalsql_cognition.c/fractalsql_textsql.c read
+          # FRACTALSQL_* via getenv() once, not a sysvar. Exported
+          # unconditionally so the later reasoning round-trip just works.
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          mysqld --user=mysql --daemonize
+
+          for i in $(seq 1 120); do
+              mysqladmin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mysqladmin ping
+
+          # Install our .deb. dpkg, not apt: the server is already
+          # installed, so the mysql-community-server dependency is
+          # satisfied and there is nothing left for apt to resolve.
+          dpkg -i ./dist/packages/fractalsql-mysql-amd64.deb
+
+          # Read @@plugin_dir from the running server — must match
+          # where our package dropped the .so or CREATE FUNCTION fails.
+          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="${PLUGIN_DIR%/}"
+          echo "plugin_dir: $PLUGIN_DIR"
+          test -f "$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from $PLUGIN_DIR"; ls -la "$PLUGIN_DIR" || true; exit 1; }
+          test -f "$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from $PLUGIN_DIR"; exit 1; }
+          ldd "$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mysql -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mysql fractalsql_ci < /work/sql/install_udf.sql
+          mysql fractalsql_ci < /work/sql/install_agents.sql
+
+          EDITION=$(mysql -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=$(mysql -N -B -e "SELECT fractal_version()" | tr -d '\r')
+          echo "edition=$EDITION version=$VERSION"
+          test "$EDITION" = "Community"
+          test "$VERSION" = "2.0.0"
+
+          # End-to-end fractal_search smoke. Trivial 4-row corpus, query
+          # equals row 0; expect a JSON document with dim/n_corpus/top_k.
+          RESULT=$(mysql -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): ${RESULT:0:200}"
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          # Params caps match the documented bounds (iterations<=10000,
+          # pop_size<=100000, diff_factor<=32). Verify each just-over-cap
+          # value is rejected (UDF sets *error=1, client shows NULL).
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=$(mysql -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '$over_params')" 2>/dev/null || true)
+              if [ -n "$OUT" ] && [ "$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=$over_params, got $OUT"; exit 1
+              fi
+              echo "ok: params-bound cap rejects $over_params"
+          done
+          echo "ok: Debian install + CREATE FUNCTION + UDF exec"
+
+          # --- Reasoning + text-to-sql round-trip against a mock LLM ---
+          python3 /work/scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          REASON=$(mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+          echo "reason reply: ${REASON:0:80}"
+          echo "$REASON" | grep -qi sql \
+              || { echo "FAIL: reasoning round-trip returned '$REASON'"; kill $MOCK_PID 2>/dev/null || true; exit 1; }
+          echo "ok: reasoning round-trip via mock endpoint"
+
+          T2S=$(mysql -N -B -e "SELECT fractal_t2s_generate(CONNECTION_ID(), 'how many rows', '', NULL)")
+          echo "t2s generate: ${T2S:0:80}"
+          echo "$T2S" | grep -qi select \
+              || { echo "FAIL: text-to-sql GENERATE returned '$T2S'"; kill $MOCK_PID 2>/dev/null || true; exit 1; }
+          echo "ok: text-to-sql GENERATE round-trip via mock endpoint"
+
+          kill $MOCK_PID 2>/dev/null || true
+          SCRIPT
+          chmod +x test-deb.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" \
+              -w /work \
+              ubuntu:24.04 \
+              bash /work/test-deb.sh
+
+  # ------------------------------------------------------------------
+  # Runs inside a bare ubuntu:24.04 container with no systemd (mysqld
+  # started directly, same as debian-install above) -- this deliberately
+  # exercises scripts/easy_install.sh's non-systemd restart fallback
+  # (restart_mysqld_direct), not just the systemctl path a real Debian
+  # host would take. See easy_install.sh's own header comment for why
+  # that fallback exists at all.
+  # ------------------------------------------------------------------
+  easy-install-linux:
+    name: "easy_install.sh: Debian wizard, non-interactive (mysql 8.4 LTS)"
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+      - name: Install package, then run easy_install.sh against a mock LLM
+        run: |
+          cat > test-easy-install.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y wget gnupg lsb-release ca-certificates python3
+
+          # Same server install as debian-install above (Oracle's apt
+          # repo, pinned to the 8.4 LTS channel).
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+              | debconf-set-selections
+          dpkg -i mysql-apt-config_0.8.35-1_all.deb
+          apt-get update -qq
+          apt-get install -qq -y mysql-community-server
+
+          mkdir -p /var/run/mysqld /var/log/mysql
+          chown mysql:mysql /var/run/mysqld /var/log/mysql
+          mysqld --user=mysql --daemonize
+          for i in $(seq 1 60); do mysqladmin ping >/dev/null 2>&1 && break; sleep 1; done
+          mysqladmin ping
+          mysql -u root -e "CREATE DATABASE fractalsql_ci;"
+
+          # Package already installed manually here (mirrors
+          # debian-install) so is_installed() detects it and Phase B
+          # (--no-install) is never exercised, same as anyone who ran
+          # dpkg -i first.
+          dpkg -i ./dist/packages/fractalsql-mysql-amd64.deb
+
+          python3 scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # ollama mode sets FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1; openai-compatible doesn't.
+          chmod +x scripts/easy_install.sh
+          ./scripts/easy_install.sh \
+              --no-install --yes --database fractalsql_ci \
+              --provider ollama \
+              --url http://127.0.0.1:18080/v1/chat/completions \
+              --model mock-model \
+              --embed-url http://127.0.0.1:18080/v1/embeddings \
+              --embed-model mock-embed --think off | tee /tmp/easy-install.log
+
+          kill ${MOCK_PID} 2>/dev/null || true
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.sh's
+          # reasoning-tier gates -- see that script's own header
+          # comment).
+          grep -qi 'select 1' /tmp/easy-install.log \
+              || { echo "FAIL: reasoning round-trip via easy_install.sh didn't reach the mock reply"; exit 1; }
+
+          EDITION=$(mysql -u root -D fractalsql_ci -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mysql -u root -D fractalsql_ci -N -B -e "SELECT fractal_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+          test "${VERSION}" = "2.0.0"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (Debian, non-systemd container)"
+          SCRIPT
+          chmod +x test-easy-install.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" -w /work \
+              ubuntu:24.04 bash /work/test-easy-install.sh
+
+  # ------------------------------------------------------------------
+  # Stage 2b: RHEL install test (Rocky Linux 9).
+  # Installs mysql-community-server via Oracle's el9 community repo
+  # (matches the .rpm's --depends), installs our .rpm, and runs the
+  # same suite. Rocky 9 is the CI-friendly stand-in for RHEL 9; same
+  # RPM tooling, same /usr/lib64/ convention, same result.
+  # ------------------------------------------------------------------
+  rpm-install:
+    name: RHEL (Rocky 9) — install + CREATE FUNCTION
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for sql/*.sql + scripts/ci/mock_llm.py)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: packages-amd64
+          path: dist/packages
+
+      - name: Install + verify in rockylinux:9
+        run: |
+          cat > test-rpm.sh <<'SCRIPT'
+          set -euo pipefail
+          # Enable the MySQL Community el9 repo; the installed
+          # .rpm depends on mysql-community-server, which el9's
+          # stock module ships as AppStream "mysql" — different
+          # package name. We disable the stock module so Oracle's
+          # community repo wins.
+          dnf install -qy https://dev.mysql.com/get/mysql84-community-release-el9-1.noarch.rpm
+          dnf module -qy reset mysql 2>/dev/null || true
+          dnf module -qy disable mysql 2>/dev/null || true
+          dnf install -qy mysql-community-server
+
+          mkdir -p /var/lib/mysql /var/log/mysql /var/run/mysqld
+          chown -R mysql:mysql /var/lib/mysql /var/log/mysql /var/run/mysqld
+          mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql
+          mysqld --user=mysql --daemonize
+
+          for i in $(seq 1 120); do
+              mysqladmin ping >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mysqladmin ping
+
+          # Reasoning env must be in mysqld's environment before it
+          # starts (see the Debian job's comment).
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
+          dnf install -qy ./dist/packages/fractalsql-mysql-amd64.rpm
+
+          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir" | tr -d '\r')
+          PLUGIN_DIR="${PLUGIN_DIR%/}"
+          echo "plugin_dir: $PLUGIN_DIR"
+          test -f "$PLUGIN_DIR/fractalsql.so" \
+              || { echo "FAIL: fractalsql.so missing from $PLUGIN_DIR"; ls -la "$PLUGIN_DIR" || true; exit 1; }
+          test -f "$PLUGIN_DIR/fractalsql-reasoning-http.so" \
+              || { echo "FAIL: fractalsql-reasoning-http.so missing from $PLUGIN_DIR"; exit 1; }
+          ldd "$PLUGIN_DIR/fractalsql-reasoning-http.so" | grep -qi libcurl \
+              || { echo "FAIL: reasoning plugin not linked to libcurl"; ldd "$PLUGIN_DIR/fractalsql-reasoning-http.so"; exit 1; }
+
+          # install_udf.sql registers the fractal_schema_context stored
+          # procedure after the global CREATE FUNCTIONs -- CREATE/DROP
+          # PROCEDURE need a database selected (ERROR 1046 "No database
+          # selected" otherwise), even though the FUNCTIONs themselves
+          # are server-global.
+          mysql -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mysql fractalsql_ci < /work/sql/install_udf.sql
+          mysql fractalsql_ci < /work/sql/install_agents.sql
+
+          EDITION=$(mysql -N -B -e "SELECT fractal_edition()" | tr -d '\r')
+          VERSION=$(mysql -N -B -e "SELECT fractal_version()" | tr -d '\r')
+          echo "edition=$EDITION version=$VERSION"
+          test "$EDITION" = "Community"
+          test "$VERSION" = "2.0.0"
+
+          RESULT=$(mysql -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}')")
+          echo "fractal_search result (first 200 chars): ${RESULT:0:200}"
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "$RESULT" | grep -q '"n_corpus":4' || { echo "FAIL: missing n_corpus:4"; exit 1; }
+          echo "$RESULT" | grep -q '"top_k":' || { echo "FAIL: missing top_k"; exit 1; }
+          echo "ok: fractal_search returned canonical JSON"
+
+          for over_params in \
+              '{"iterations":10001}' \
+              '{"population_size":100001}' \
+              '{"diffusion_factor":33}'; do
+              # A UDF that sets *error surfaces as a NULL result with a
+              # zero client exit, not as a non-zero exit, so "empty or
+              # NULL" is the rejection signal here.
+              OUT=$(mysql -N -B -e "SELECT fractal_search('1,0;0,1', '1,0', 1, '$over_params')" 2>/dev/null || true)
+              if [ -n "$OUT" ] && [ "$OUT" != "NULL" ]; then
+                  echo "FAIL: expected rejection on params=$over_params, got $OUT"; exit 1
+              fi
+              echo "ok: params-bound cap rejects $over_params"
+          done
+          echo "ok: RPM install + CREATE FUNCTION + UDF exec"
+
+          # --- Reasoning + text-to-sql round-trip against a mock LLM ---
+          dnf install -qy python3
+          python3 /work/scripts/ci/mock_llm.py 18080 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          REASON=$(mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
+          echo "reason reply: ${REASON:0:80}"
+          echo "$REASON" | grep -qi sql \
+              || { echo "FAIL: reasoning round-trip returned '$REASON'"; kill $MOCK_PID 2>/dev/null || true; exit 1; }
+          echo "ok: reasoning round-trip via mock endpoint"
+
+          T2S=$(mysql -N -B -e "SELECT fractal_t2s_generate(CONNECTION_ID(), 'how many rows', '', NULL)")
+          echo "t2s generate: ${T2S:0:80}"
+          echo "$T2S" | grep -qi select \
+              || { echo "FAIL: text-to-sql GENERATE returned '$T2S'"; kill $MOCK_PID 2>/dev/null || true; exit 1; }
+          echo "ok: text-to-sql GENERATE round-trip via mock endpoint"
+
+          kill $MOCK_PID 2>/dev/null || true
+          SCRIPT
+          chmod +x test-rpm.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" \
+              -w /work \
+              rockylinux:9 \
+              bash /work/test-rpm.sh
+
+  # ------------------------------------------------------------------
+  # macOS: native build + Homebrew install + reasoning round-trip,
+  # which doesn't fit the container jobs above. Homebrew's mysql
+  # formula initializes root@localhost with an empty password
+  # (--initialize-insecure semantics), so the bare client connects.
+  # ------------------------------------------------------------------
+  macos-install:
+    name: macOS — build + install + reason (Homebrew, arm64)
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL (Homebrew) + start it
+        run: |
+          set -euo pipefail
+          brew install mysql openssl@3
+          brew services start mysql
+          # Homebrew's MySQL initializes root@localhost with an EMPTY
+          # password (--initialize-insecure bootstrap), so the bare
+          # client connects. openssl@3 keg-only: needed for
+          # fractalsql_enterprise.c's Ed25519 check below.
+          for i in $(seq 1 30); do
+              mysql -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mysql -e 'SELECT 1'
+
+      - name: Compile fractalsql.dylib (native arm64)
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          # mysql-client is pulled in by the mysql formula (server
+          # depends on it); mysql_config ships in its keg.
+          MYSQL_CFLAGS="$(mysql_config --cflags)"
+          # Homebrew's openssl@3 is keg-only and the macos-14 SDK ships
+          # no OpenSSL headers: without -I/-L/-lcrypto the build dies at
+          # fractalsql_enterprise.c's #include <openssl/evp.h>.
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          mkdir -p dist/darwin
+          clang -Wall -Wextra -O3 -fPIC \
+              -arch arm64 \
+              ${MYSQL_CFLAGS} \
+              -I"${OPENSSL_PREFIX}/include" \
+              -Iinclude \
+              -ffunction-sections -fdata-sections -fvisibility=default \
+              -dynamiclib \
+              -Wl,-dead_strip \
+              -o dist/darwin/fractalsql.dylib \
+              src/fractalsql.c \
+              src/fractalsql_parse.c \
+              src/fractalsql_session.c \
+              src/fractalsql_vector.c \
+              src/fractalsql_cognition.c \
+              src/fractalsql_textsql.c \
+              src/fractalsql_enterprise.c \
+              "${CORE_A}" \
+              -L"${OPENSSL_PREFIX}/lib" -lcrypto \
+              -lm -lpthread
+          ls -l dist/darwin/fractalsql.dylib
+
+      - name: Install into Homebrew's mysql plugin_dir + register UDFs
+        run: |
+          set -euo pipefail
+          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir")
+          echo "plugin_dir: ${PLUGIN_DIR}"
+          cp dist/darwin/fractalsql.dylib "${PLUGIN_DIR}/fractalsql.so"
+          # install -m 0755, not cp: macOS dyld refuses to
+          # mmap(PROT_EXEC) a .so without the exec bit (Linux never
+          # checks it, so only this job would break), and the only
+          # symptom is a bare NULL from every reasoning call.
+          install -m 0755 include/darwin-arm64/fractalsql-reasoning-http.so "${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          mysql -e 'CREATE DATABASE IF NOT EXISTS fractalsql_ci;'
+          mysql fractalsql_ci < sql/install_udf.sql
+          mysql fractalsql_ci < sql/install_agents.sql
+
+          EDITION=$(mysql -N -B -e "SELECT fractal_edition();")
+          VERSION=$(mysql -N -B -e "SELECT fractal_version();")
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+          test "${VERSION}" = "2.0.0"
+
+          RESULT=$(mysql -N -B -e "SELECT fractal_search('1,0,0,0;0.9,0.1,0,0;0,1,0,0;0,0,1,0', '1,0,0,0', 2, '{}');")
+          echo "$RESULT" | grep -q '"dim":4' || { echo "FAIL: missing dim:4"; exit 1; }
+          echo "ok: macOS build + install + fractal_search"
+
+      - name: Reasoning round-trip against a mock endpoint
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/mock_llm.py 18080 >/tmp/mock_llm.out 2>&1 &
+          MOCK_PID=$!
+          for i in $(seq 1 50); do
+              nc -z 127.0.0.1 18080 >/dev/null 2>&1 && break
+              sleep 0.2
+          done
+
+          # Reasoning config is a process env var, read once by
+          # fractalsql_cognition.c. It must be set BEFORE mysqld's
+          # next dlopen of a reasoning path, so the server is restarted
+          # with the config in its environment (see below for why that
+          # restart is a direct mysqld start, not brew services).
+          PLUGIN_DIR=$(mysql -N -B -e "SELECT @@plugin_dir")
+          # The reasoning core requires a canonical plugin path: the
+          # configured value must equal its own realpath. @@plugin_dir
+          # here is both slash-terminated (giving plugin//file.so) and,
+          # under Homebrew, a symlink to the versioned Cellar dir;
+          # resolving to the physical path is what makes it canonical.
+          PLUGIN_DIR="$(cd "${PLUGIN_DIR}" && pwd -P)"
+          brew services stop mysql
+          export FRACTALSQL_REASONING_PLUGIN="${PLUGIN_DIR}/fractalsql-reasoning-http.so"
+          export FRACTALSQL_HTTP_URL="http://127.0.0.1:18080/v1/chat/completions"
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+          # brew services runs under launchd, which won't inherit this
+          # shell's export, so run mysqld directly instead for this
+          # one check, matching the Linux jobs' manual-start pattern.
+          MYSQL_DATADIR=$(mysql -N -B -e "SELECT @@datadir" 2>/dev/null || echo "$(brew --prefix)/var/mysql")
+          "$(brew --prefix mysql)/bin/mysqld" \
+              --datadir="${MYSQL_DATADIR}" --socket=/tmp/fsql_install_test.sock \
+              --skip-networking=0 --port=13306 --pid-file=/tmp/fsql_install_test.pid &
+          MY_PID=$!
+          for i in $(seq 1 50); do
+              mysql -S /tmp/fsql_install_test.sock -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 0.5
+          done
+
+          # 2>&1 on purpose: a NULL without a UDF error and a UDF that
+          # failed to initialize ("ERROR 1123 ... Can't initialize
+          # function 'fractal_reason'; <reason>") look identical on
+          # stdout -- the error text is the discriminator between a
+          # plugin-load failure and a dispatch failure.
+          REPLY=$(mysql -S /tmp/fsql_install_test.sock -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping');" 2>&1) || true
+          echo "reason reply: ${REPLY:0:80}"
+          # Environment actually inside the server process, captured
+          # before it's killed: BSD ps -E shows it, and it separates
+          # "the exports never reached mysqld" from everything else.
+          MY_ENV=$(ps -E -p "${MY_PID}" -o command= 2>/dev/null || true)
+          # Diagnose BEFORE any kill -- a reachability probe after the
+          # mock is dead can only ever print "no".
+          echo "--- server still reachable? ---"
+          mysql -S /tmp/fsql_install_test.sock -N -B -e \
+            "SELECT @@plugin_dir" 2>&1 || true
+          echo "--- mock still reachable? ---"
+          nc -z 127.0.0.1 18080 && echo "yes" || echo "no"
+          echo "--- mock requests seen this run (if any) ---"
+          cat /tmp/mock_llm.out 2>/dev/null || echo "(no mock output)"
+          # Standalone dlopen of the staged plugin, outside mysqld:
+          # its dlerror text separates "this file will not load in any
+          # process" (bad mode/arch/signature/dependency) from "loads
+          # standalone but fails inside the server".
+          echo "--- standalone dlopen probe ---"
+          python3 - <<'PY' || true
+          import ctypes
+          import os
+          so = os.environ.get("FRACTALSQL_REASONING_PLUGIN", "")
+          if not so:
+              print("standalone dlopen: skipped, no FRACTALSQL_REASONING_PLUGIN")
+          else:
+              try:
+                  # RTLD_LAZY, not ctypes' RTLD_NOW default: mirrors the
+                  # server's dlopen and keeps loadability (mode/arch/
+                  # signature/dependencies) the verdict, not any lazy
+                  # undefined symbol.
+                  ctypes.CDLL(so, mode=os.RTLD_LAZY)
+                  print("standalone dlopen: OK")
+              except OSError as e:
+                  print("standalone dlopen FAILED:", e)
+          PY
+          ls -l "${PLUGIN_DIR}"
+          kill "${MOCK_PID}" 2>/dev/null || true
+          kill "${MY_PID}" 2>/dev/null || true
+          echo "$REPLY" | grep -qi sql \
+              || { echo "FAIL: reasoning round-trip returned '${REPLY}'"
+                   echo "--- reasoning env in this shell ---"
+                   env | grep '^FRACTALSQL_' || echo "(none)"
+                   echo "--- env as mysqld sees it (ps -E) ---"
+                   echo "${MY_ENV:-(mysqld already exited; could not read)}"
+                   exit 1; }
+          echo "ok: macOS reasoning round-trip via mock endpoint"
+
+  # -Provider skip only: scripts/easy_install.sh's own darwin branch of
+  # apply_env_and_restart deliberately doesn't automate a reasoning
+  # restart (launchd plist edits vary per Homebrew version -- see that
+  # function's own comment). This job exercises what CAN be
+  # automated on macOS: package detection, idempotent UDF/procedure
+  # registration, and the "already registered" pause + --force-reinstall.
+  # The mock-LLM round-trip is covered by easy-install-linux instead.
+  easy-install-macos:
+    name: "easy_install.sh: macOS wizard, non-interactive (arm64)"
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL (Homebrew) and start it
+        run: |
+          set -euo pipefail
+          brew install mysql openssl@3
+          brew services start mysql
+          # No -uroot: Homebrew's MySQL initializes root@localhost with an
+          # EMPTY password (--initialize-insecure bootstrap), so the bare
+          # client connects.
+          for i in $(seq 1 30); do
+              mysql -e 'SELECT 1' >/dev/null 2>&1 && break
+              sleep 1
+          done
+          mysql -e 'SELECT 1'
+
+      - name: Build + install via scripts/macos/install.sh manually first
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-arm64/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" || { echo "FAIL: missing vendored core archive ${CORE_A}"; exit 1; }
+          # mysql-client is pulled in by the mysql formula (server
+          # depends on it); mysql_config ships in its keg. openssl@3 is
+          # keg-only and the macos-14 SDK ships no OpenSSL headers:
+          # without -I/-L/-lcrypto the build dies at
+          # fractalsql_enterprise.c's #include <openssl/evp.h> (same
+          # flags as the macos-install job's compile step above).
+          MYSQL_CFLAGS="$(mysql_config --cflags)"
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          mkdir -p /tmp/fsql-stage
+          clang -Wall -Wextra -O3 -fPIC -arch arm64 ${MYSQL_CFLAGS} \
+              -I"${OPENSSL_PREFIX}/include" -Iinclude \
+              -ffunction-sections -fdata-sections -fvisibility=default \
+              -dynamiclib -Wl,-dead_strip \
+              -o /tmp/fsql-stage/fractalsql.dylib \
+              src/fractalsql.c src/fractalsql_parse.c src/fractalsql_session.c src/fractalsql_vector.c \
+              src/fractalsql_cognition.c src/fractalsql_textsql.c src/fractalsql_enterprise.c \
+              "${CORE_A}" -L"${OPENSSL_PREFIX}/lib" -lcrypto -lm -lpthread
+          cp include/darwin-arm64/fractalsql-reasoning-http.so /tmp/fsql-stage/
+          chmod +x scripts/macos/install.sh
+          cp scripts/macos/install.sh /tmp/fsql-stage/
+          MYSQL_BIN="$(brew --prefix mysql)/bin/mysql" /tmp/fsql-stage/install.sh
+          test -f "$(mysql -N -B -e 'SELECT @@plugin_dir;')/fractalsql.so"
+
+      - name: Run easy_install.sh wizard (provider skip)
+        run: |
+          set -euo pipefail
+          mysql -e 'CREATE DATABASE fractalsql_ci;'
+          chmod +x scripts/easy_install.sh
+          MYSQL_BINDIR="$(brew --prefix mysql)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --provider skip | tee /tmp/easy-install.log
+
+          EDITION=$(mysql -D fractalsql_ci -N -B -e 'SELECT fractal_edition();')
+          VERSION=$(mysql -D fractalsql_ci -N -B -e 'SELECT fractal_version();')
+          echo "edition=${EDITION} version=${VERSION}"
+          test "${EDITION}" = "Community"
+          test "${VERSION}" = "2.0.0"
+
+          # Re-run to exercise the "already registered" pause + --force-reinstall.
+          MYSQL_BINDIR="$(brew --prefix mysql)/bin" \
+            ./scripts/easy_install.sh --no-install --yes --database fractalsql_ci --force-reinstall --provider skip
+
+          echo "ok: easy_install.sh end-to-end (macOS, provider skip)"
+
+  # Unlike release.yml's build-windows-msi job, this one also runs a real
+  # MySQL server: easy_install.ps1 detects the server through the Windows
+  # Service mysqld.exe is registered under (Get-MySqlTarget's
+  # Win32_Service scan), which the winx64.zip alone never creates -- so
+  # this job registers one itself, with `mysqld --install` against the
+  # unpacked zip's server tree. MySQL's own .msi has no silent-install
+  # properties (SERVICENAME/PASSWORD/PORT don't exist on
+  # mysql-installer-community), so zip + manual service registration is
+  # the repeatable CI path here.
+  easy-install-windows:
+    name: "easy_install.ps1: Windows wizard, non-interactive (mysql 8.4 LTS)"
+    runs-on: windows-latest
+    env:
+      MYSQL_VER: "8.4.11"
+      MYSQL_MAJOR: "8.4"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Download + unpack MySQL ${{ env.MYSQL_VER }} binaries (full server tree)
+        shell: pwsh
+        run: |
+          # Oracle hosts per-version winx64 zips containing the FULL
+          # mysql-<VER>-winx64\ tree (bin\mysqld.exe + include\). Same
+          # download recipe as release.yml's build-windows-msi job --
+          # Archives CDN first, dev.mysql.com/get/ as fallback, and a
+          # 'PK' magic-byte guard against Oracle answering 200 OK with
+          # an HTML error page -- see that job's step for the full
+          # reasoning.
+          $zipName  = "mysql-${env:MYSQL_VER}-winx64.zip"
+          $majorDir = ($env:MYSQL_VER -replace '\.\d+$', '')
+          $urls = @(
+              "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
+              "https://dev.mysql.com/get/Downloads/MySQL-$majorDir/$zipName"
+          )
+          New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
+          $dest = "deps\mysql\mysql.zip"
+          $downloaded = $false
+          foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Write-Host "Fetching (attempt $attempt) $url"
+                  try {
+                      Invoke-WebRequest -Uri $url `
+                          -OutFile $dest `
+                          -UseBasicParsing `
+                          -MaximumRedirection 10 `
+                          -Headers @{ "User-Agent" = "curl/8.0" } `
+                          -TimeoutSec 300
+                  } catch {
+                      Write-Host "  -> $($_.Exception.Message)"
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  # Guard against Oracle returning a 200 OK with an HTML
+                  # error page: real zip files start with 'PK' (0x50 0x4B).
+                  $headBytes = [System.IO.File]::ReadAllBytes($dest) |
+                                 Select-Object -First 4
+                  if ($headBytes[0] -ne 0x50 -or $headBytes[1] -ne 0x4B) {
+                      Write-Host "  -> got non-ZIP payload; retrying"
+                      Remove-Item $dest -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $downloaded = $true
+                  break
+              }
+              if ($downloaded) { break }
+          }
+          if (-not $downloaded) {
+              Write-Host "FATAL: could not fetch $zipName from any mirror"
+              exit 1
+          }
+
+          Expand-Archive -Path $dest -DestinationPath "deps\mysql" -Force
+
+          $unpacked = "deps\mysql\mysql-${env:MYSQL_VER}-winx64"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            Get-ChildItem deps\mysql -Recurse -Depth 2 | Format-Table
+            exit 1
+          }
+          if (-not (Test-Path "deps\mysql\root\bin\mysqld.exe")) {
+            Write-Host "FATAL: bin\mysqld.exe missing from unpacked tree"
+            exit 1
+          }
+
+      - name: Initialize datadir + register a real MySQL Windows Service
+        shell: pwsh
+        run: |
+          $root = Join-Path (Get-Location) 'deps\mysql\root'
+          $myIni = Join-Path $root 'my.ini'
+          @"
+          [mysqld]
+          basedir=$($root -replace '\\', '/')
+          datadir=$($root -replace '\\', '/')/data
+          port=3306
+          "@ | Set-Content -Path $myIni -Encoding ascii
+
+          & (Join-Path $root 'bin\mysqld.exe') --defaults-file="$myIni" --initialize-insecure --console
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: --initialize-insecure exited $LASTEXITCODE"; exit 1 }
+
+          # Register the service so easy_install.ps1's Get-MySqlTarget
+          # (its Win32_Service scan for bin\mysqld.exe) and the
+          # service-Environment write + restart path both work, exactly
+          # like a real user install does.
+          & (Join-Path $root 'bin\mysqld.exe') --install FractalSQLCI "--defaults-file=$myIni"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: mysqld --install exited $LASTEXITCODE"; exit 1 }
+          Start-Service -Name 'FractalSQLCI'
+
+          $mysqlExe = Join-Path $root 'bin\mysql.exe'
+          $ready = $false
+          for ($i = 0; $i -lt 60; $i++) {
+              & $mysqlExe -h 127.0.0.1 -P 3306 -u root -e 'SELECT 1;' 2>$null
+              if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { Write-Host "FATAL: mysqld never accepted connections"; exit 1 }
+
+          # Set a root password with mysql_native_password. Two MySQL
+          # constraints force this:
+          #   1. easy_install.ps1's Resolve-RootPassword, run under -Yes,
+          #      auto-answers the "does root need a password?" prompt
+          #      yes, then needs the password non-interactively.
+          #   2. MySQL's default caching_sha2_password does a full-
+          #      authentication handshake on a non-TLS connection that
+          #      needs the client's --get-server-public-key -- which
+          #      easy_install.ps1's Invoke-MySql never passes, and the
+          #      in-memory fast-path cache is wiped by the very service
+          #      restart the wizard itself performs. mysql_native_password
+          #      (still enabled by default on 8.4 LTS) has no such
+          #      handshake, so the wizard's plain mysql.exe invocations
+          #      keep working across that restart.
+          & $mysqlExe -h 127.0.0.1 -P 3306 -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'fractalsql-ci'; CREATE DATABASE fractalsql_ci;"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: could not set root password / create database"; exit 1 }
+          Get-Service FractalSQLCI
+
+      - name: Build fractalsql.dll (scripts\windows\build.bat)
+        shell: cmd
+        env:
+          MYSQL_MAJOR: ${{ env.MYSQL_MAJOR }}
+          # Same VCPKG_ROOT pin as release.yml's build-windows-msi job:
+          # newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # pointing at an install tree that has no OpenSSL, which
+          # build.bat would resolve OPENSSL_DIR against.
+          VCPKG_ROOT: 'C:\vcpkg'
+        run: |
+          set MYSQL_DIR=%CD%\deps\mysql\root
+          set OUT_DIR=%CD%\dist\windows\my%MYSQL_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check -- same vcpkg tool and install path release.yml's
+          REM build-windows-msi job uses.
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          copy /Y "%OUT_DIR%\fractalsql.dll" fractalsql.dll
+          if not exist "fractalsql.dll" (
+              echo FATAL: fractalsql.dll not found after build.bat
+              exit /b 1
+          )
+
+      - name: Install our plugin into the running MySQL server
+        shell: pwsh
+        run: |
+          $env:MYSQL_PWD = 'fractalsql-ci'
+          $myExe = 'deps\mysql\root\bin\mysql.exe'
+          & $myExe -h 127.0.0.1 -P 3306 -u root -e "SELECT 1;"
+          # Live @@plugin_dir, not a 'lib\plugin' guess under the install
+          # root, same approach as easy_install.ps1's own
+          # Resolve-PluginDir. Normalize the double-backslash output
+          # first (see Resolve-PluginDir's comment for why that
+          # normalization matters at all).
+          $pluginDir = (& $myExe -h 127.0.0.1 -P 3306 -u root -N -B -e "SELECT @@plugin_dir;").Trim()
+          $pluginDir = ($pluginDir -replace '\\\\', '\').TrimEnd('\')
+          if (-not $pluginDir) { Write-Host "FATAL: SELECT @@plugin_dir returned nothing"; exit 1 }
+          Write-Host "plugin_dir: $pluginDir"
+          Copy-Item "fractalsql.dll" (Join-Path $pluginDir 'fractalsql.dll')
+          # The wizard's reasoning config points FRACTALSQL_REASONING_
+          # PLUGIN at <plugin_dir>\fractalsql-reasoning-http.dll, so the
+          # vendored reasoning plugin must sit next to fractalsql.dll --
+          # without it fractal_reason() can't dlopen anything and NULLs.
+          Copy-Item "include\windows-x86_64\fractalsql-reasoning-http.dll" (Join-Path $pluginDir 'fractalsql-reasoning-http.dll')
+
+      - name: Run easy_install.ps1 against a mock LLM
+        shell: pwsh
+        run: |
+          # Same launch discipline as build_test.ps1's own mock startup:
+          # quote the script path (Start-Process -ArgumentList joins the
+          # array with spaces without quoting), capture stdout/stderr so
+          # a bind failure is diagnosable instead of a silent NULL, and
+          # poll the port rather than assuming a fixed sleep was enough.
+          $mockLog = Join-Path $pwd 'mock_llm.log'
+          $py = (Get-Command python).Source
+          $null = Start-Process -FilePath $py `
+              -ArgumentList @("`"$pwd\scripts\ci\mock_llm.py`"", '18080') `
+              -RedirectStandardOutput $mockLog -RedirectStandardError "$mockLog.err" `
+              -PassThru -WindowStyle Hidden
+          $up = $false
+          for ($i = 0; $i -lt 50; $i++) {
+              $c = New-Object Net.Sockets.TcpClient
+              try { $c.Connect('127.0.0.1', 18080); $up = $true } catch { } finally { $c.Dispose() }
+              if ($up) { break }
+              Start-Sleep -Milliseconds 200
+          }
+          if (-not $up) {
+              Write-Host "FATAL: mock_llm.py never came up on 127.0.0.1:18080"
+              if (Test-Path "$mockLog.err") { Get-Content "$mockLog.err" }
+              if (Test-Path $mockLog)    { Get-Content $mockLog }
+              exit 1
+          }
+
+          # Deliberately no -MysqlDir: this exercises the script's own
+          # Win32_Service-based auto-detection (Get-MySqlTarget) against
+          # the real registered service above, not a manual override.
+          #
+          # -Provider ollama, not openai-compatible: ollama mode sets
+          # FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1 automatically, which this
+          # plaintext local mock needs.
+          & pwsh -File .\scripts\windows\easy_install.ps1 `
+              -RootPassword 'fractalsql-ci' -Database 'fractalsql_ci' `
+              -Provider ollama `
+              -Url 'http://127.0.0.1:18080/v1/chat/completions' `
+              -Model 'mock-model' `
+              -EmbedUrl 'http://127.0.0.1:18080/v1/embeddings' `
+              -EmbedModel 'mock-embed' -Think off `
+              -NoInstall -Yes 2>&1 | Tee-Object -FilePath easy-install.log
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "FATAL: easy_install.ps1 exited $LASTEXITCODE"
+              exit 1
+          }
+
+          # scripts/ci/mock_llm.py's canned chat reply is a fenced
+          # ```sql SELECT 1``` block (shared with build_test.ps1's
+          # reasoning-tier gates).
+          $hit = Select-String -Path easy-install.log -Pattern 'select 1' -Quiet
+          if (-not $hit) {
+              Write-Host "FAIL: reasoning round-trip via easy_install.ps1 didn't reach the mock reply"
+              Write-Host "--- mock_llm.log ---"
+              if (Test-Path mock_llm.log)     { Get-Content mock_llm.log }
+              if (Test-Path mock_llm.log.err) { Get-Content mock_llm.log.err }
+              exit 1
+          }
+
+          $edition = Select-String -Path easy-install.log -Pattern 'fractal_edition\(\) = (\S+),' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+          Write-Host "edition=$edition"
+          if ($edition -ne 'Community') {
+              Write-Host "FAIL: fractal_edition() line not found or unexpected in easy-install.log"
+              exit 1
+          }
+          Write-Host "ok: easy_install.ps1 end-to-end (Windows, mysql 8.4 LTS)"

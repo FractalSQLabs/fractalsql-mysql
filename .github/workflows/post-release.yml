@@ -1,0 +1,160 @@
+name: Post-release SBOM + Attestation + Sign
+
+# Runs AFTER release.yml has published a GitHub Release. Generates a
+# Syft SBOM for the repo tree at the tag, attests build provenance on
+# each release artifact, signs each artifact with cosign (keyless via
+# Sigstore's fulcio CA), and uploads the SBOM + signatures + certs
+# back to the release as additional assets.
+#
+# This workflow is isolated from release.yml by design: if it fails
+# mid-run for any reason (e.g., a Syft breaking change, OIDC issuer
+# outage, Sigstore transparency log hiccup), the Release itself is
+# already published with its primary artifacts intact. The SBOM /
+# attestation / signatures are supplementary, not load-bearing on
+# the release being usable. Re-run manually via workflow_dispatch.
+
+on:
+  release:
+    types: [published]
+  # Manual trigger for retry or backfill against an existing release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to process (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  # contents: write — attach SBOM + .sig + .pem back to the Release
+  # id-token: write — OIDC for cosign keyless signing and build-provenance attestation
+  # attestations: write — create attestations via actions/attest-build-provenance
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sbom-attest-sign:
+    name: SBOM + Attest + Sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+              echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Checkout the exact tag so the SBOM reflects the source tree at
+      # release time, not whatever is on HEAD.
+      - name: Checkout tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # -----------------------------------------------------------
+      # SBOM generation (NTIA / NIST-aligned).
+      # -----------------------------------------------------------
+      - name: Generate SPDX SBOM with Syft
+        id: sbom
+        uses: anchore/sbom-action@d8a2c0130026bf585de5c176ab8f7ce62d75bf04  # v0.20.7
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: fractalsql-mysql-${{ steps.tag.outputs.tag }}.spdx.json
+          output-file: sbom.spdx.json
+          upload-release-assets: true
+          upload-artifact: true
+
+      # -----------------------------------------------------------
+      # Download the release's primary artifacts so we can attest
+      # and sign them.
+      # -----------------------------------------------------------
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.tag.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --dir dist \
+              --pattern '*.deb' \
+              --pattern '*.rpm' \
+              --pattern '*.msi' \
+              --pattern '*.zip' \
+              || echo "note: no matching assets on release yet — continuing"
+          ls -la dist || true
+
+      - name: Check there is anything to sign
+        id: have_assets
+        run: |
+          count=$(find dist -maxdepth 1 -type f \
+                \( -name '*.deb' -o -name '*.rpm' -o -name '*.msi' -o -name '*.zip' \) \
+                2>/dev/null | wc -l)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "Found ${count} release artifact(s) to attest + sign."
+
+      # -----------------------------------------------------------
+      # Build-provenance attestation — GitHub-native, SLSA L2+.
+      # -----------------------------------------------------------
+      - name: Attest build provenance
+        if: steps.have_assets.outputs.count != '0'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.msi
+            dist/*.zip
+
+      # -----------------------------------------------------------
+      # Cosign keyless signing (Sigstore public good).
+      # Produces .sig (signature) + .pem (certificate from fulcio)
+      # for each artifact. Verifiable with:
+      #   cosign verify-blob \
+      #       --certificate <artifact>.pem \
+      #       --signature <artifact>.sig \
+      #       --certificate-identity-regexp '...' \
+      #       --certificate-oidc-issuer-regexp '...' \
+      #       <artifact>
+      # -----------------------------------------------------------
+      - name: Install cosign
+        if: steps.have_assets.outputs.count != '0'
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da  # v3.7.0
+
+      - name: Sign release artifacts with cosign
+        if: steps.have_assets.outputs.count != '0'
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for f in dist/*.deb dist/*.rpm dist/*.msi dist/*.zip; do
+              [ -f "$f" ] || continue
+              echo "--- signing $f ---"
+              cosign sign-blob \
+                  --yes \
+                  --output-signature "${f}.sig" \
+                  --output-certificate "${f}.pem" \
+                  "$f"
+          done
+
+      - name: Upload signatures + certs to release
+        if: steps.have_assets.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t sigs < <(ls dist/*.sig dist/*.pem 2>/dev/null || true)
+          if [ ${#sigs[@]} -eq 0 ]; then
+              echo "note: no signatures produced — nothing to upload"
+              exit 0
+          fi
+          gh release upload \
+              "${{ steps.tag.outputs.tag }}" \
+              "${sigs[@]}" \
+              --repo "${{ github.repository }}" \
+              --clobber

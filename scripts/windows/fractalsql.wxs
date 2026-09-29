@@ -1,43 +1,45 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  scripts/windows/fractalsql.wxs — WiX Toolset source for the
+  scripts/windows/fractalsql.wxs: WiX Toolset source for the
   FractalSQL MySQL UDF Windows MSI.
 
   Driven by four preprocessor vars supplied by build-msi.bat:
-    -dMYSQL_MAJOR=8.0 | 8.4 | 9.1          (dotted, for display)
-    -dMYSQL_MAJOR_TAG=8_0 | 8_4 | 9_1      (sanitized, for WiX IDs)
-    -dMYSQL_MAJOR_HEX=0800 | 0804 | 0901   (4 hex chars, for GUIDs)
+    -dMYSQL_MAJOR=8.4 | 9.7 | 26.7 (dotted, for display)
+    -dMYSQL_MAJOR_TAG=8_4 | 9_7 | 26_7 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-my...
-    -dMSI_VERSION=1.0.0
-  plus the standard candle -arch x64, which populates
+    -dMSI_VERSION=2.0.0
+  plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
   UX flow
-    1. Welcome / EULA (bundled LICENSE).
+    1. Welcome / EULA. WixUI_InstallDir's LicenseAgreementDlg is
+       populated exclusively by the WixUILicenseRtf WixVariable below;
+       without it the WixUIExtension silently falls back to its own
+       bundled placeholder (lorem ipsum), so this must point at the
+       plain Apache 2.0 text (converted to RTF) shown in the dialog.
     2. WixUI_InstallDir lets the user pick the MySQL install root
-       (default: C:\Program Files\MySQL\MySQL Server X.Y). This
-       must be the folder that Oracle's own MSI server installer
-       created, i.e. the folder containing lib\plugin\.
+       (default: C:\Program Files\MySQL\MySQL Server X.Y). This must
+       be the folder containing lib\plugin\.
     3. Install copies fractalsql.dll into lib\plugin\, and the
-       install SQL plus LICENSE files into
-       share\doc\mysql-fractalsql\.
+       install SQL plus LICENSE files into share\doc\fractalsql-mysql\.
     4. Uninstall removes every file cleanly.
 
   Per-MySQL-major UpgradeCode
-    Each MySQL major gets its own UpgradeCode so installing the
-    8.0 and 8.4 MSIs side-by-side does not trigger MajorUpgrade on
-    either. ProductId=* forces a fresh ProductCode per build, so
-    re-installing the same MSI overwrites cleanly.
+    Each MySQL major gets its own UpgradeCode so installing the 8.4,
+    9.7, and 26.7 MSIs side-by-side does not trigger MajorUpgrade on
+    any of them.
+    ProductId=* forces a fresh ProductCode per build, so re-installing
+    the same MSI overwrites cleanly.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 
-  <?if $(var.MYSQL_MAJOR_HEX) = "0800" ?>
-      <?define UpgradeCode = "C2F7B6E1-3B20-4D12-AEB4-DF02BB60EC01" ?>
-  <?elseif $(var.MYSQL_MAJOR_HEX) = "0804" ?>
-      <?define UpgradeCode = "C2F7B6E1-3B20-4D12-AEB4-DF02BB60EC02" ?>
-  <?elseif $(var.MYSQL_MAJOR_HEX) = "0901" ?>
-      <?define UpgradeCode = "C2F7B6E1-3B20-4D12-AEB4-DF02BB60EC03" ?>
+  <?if $(var.MYSQL_MAJOR_HEX) = "0804" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB101" ?>
+  <?elseif $(var.MYSQL_MAJOR_HEX) = "0907" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB102" ?>
+  <?elseif $(var.MYSQL_MAJOR_HEX) = "2607" ?>
+      <?define UpgradeCode = "B1E6A5F0-2A10-4C01-9DA3-CE01AA5FB103" ?>
   <?else ?>
       <?error Unsupported MYSQL_MAJOR_HEX: $(var.MYSQL_MAJOR_HEX) ?>
   <?endif ?>
@@ -59,78 +61,50 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of FractalSQL for MySQL $(var.MYSQL_MAJOR) is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- EULA dialog text. Resolved relative to the directory light
+         runs from (repo root, per build-msi.bat's pushd), and kept in
+         sync with the LICENSE file also shipped into share\doc\. -->
+    <WixVariable Id="WixUILicenseRtf" Value="scripts\windows\License.rtf" />
+
     <!-- WixUI_InstallDir targets the MySQL-install-root folder. The
          power-user override for a non-default MySQL root (e.g.
-         D:\MySQL\MySQL Server 8.4) retargets the whole tree —
+         D:\MySQL\MySQL Server 8.4) retargets the whole tree:
          fractalsql.dll still lands under lib\plugin\ of that chosen
          root. PLUGINDIR is exposed separately for scripted installs
          that want to point the DLL at an even more unusual location. -->
     <Property Id="WIXUI_INSTALLDIR" Value="MYSQLROOT" />
 
-    <!-- Registry-backed install-root auto-discovery.
-
-         Oracle's MySQL Installer records the per-major server install
-         directory under
-           HKLM\SOFTWARE\MySQL AB\MySQL Server <MAJOR>\Location  (REG_SZ)
-         so picking up that value lets this MSI land fractalsql.dll
-         inside the real lib\plugin\ of whichever MySQL the admin
-         actually chose — including non-default drive installs like
-         D:\MySQL\MySQL Server 8.4\ — without the user having to
-         retarget the folder picker.
-
-         When the property Id matches a Directory Id, MSI substitutes
-         the property value for the directory's computed default path
-         during CostFinalize, and WixUI_InstallDir reads it as the
-         folder-picker's initial value. If the key is absent (e.g.
-         zip-based MySQL installs don't write it), the property stays
-         empty and the default directory tree below takes over.
-
-         Win64="yes" routes the search at the 64-bit registry view —
-         correct since Platform="x64" is the only supported arch here
-         and MySQL's 64-bit installer writes to the 64-bit hive. -->
-    <Property Id="MYSQLROOT">
-      <RegistrySearch Id="SearchMySQLServerLocation"
-                      Root="HKLM"
-                      Key="SOFTWARE\MySQL AB\MySQL Server $(var.MYSQL_MAJOR)"
-                      Name="Location"
-                      Type="raw"
-                      Win64="yes" />
-    </Property>
-
-    <!-- Oracle does not publish 32-bit or ARM64 Windows server
-         binaries on the current MySQL majors (8.0 / 8.4 / 9.x), so
-         there's no host server for a win32 x86 or arm64 UDF DLL.
-         Both cells are deferred until upstream host binaries exist. -->
+    <!-- Oracle does not publish a 32-bit Windows build of current
+         MySQL majors (8.4 LTS / 9.7 LTS / 26.x), so there's no host
+         server for a win32 x86 MSI. arm64 is likewise deferred until
+         Oracle
+         publishes an extractable Windows ARM64 build. -->
     <?if $(sys.BUILDARCH) = "x86" ?>
         <?error MySQL UDFs are not shipped for win32 x86 (no MySQL host binary). ?>
     <?endif ?>
-    <?if $(sys.BUILDARCH) = "arm64" ?>
-        <?error MySQL UDFs are not shipped for Windows ARM64 (no MySQL host binary). ?>
-    <?endif ?>
 
     <!--
-         Directory layout mirrors the Oracle MySQL Windows default
-         install:
+         Directory layout mirrors the MySQL Windows default install:
            C:\Program Files\MySQL\MySQL Server X.Y\
              lib\
-               plugin\            fractalsql.dll
+               plugin\              fractalsql.dll
              share\
                doc\
-                 mysql-fractalsql\ LICENSE
-                                   LICENSE-THIRD-PARTY
-                                   install_udf.sql
-                                   README.txt
+                 fractalsql-mysql\  LICENSE
+                                    LICENSE-THIRD-PARTY
+                                    install_udf.sql
+                                    README.txt
     -->
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="MYSQLPARENT" Name="MySQL">
+        <Directory Id="MysqlRootParent" Name="MySQL">
           <Directory Id="MYSQLROOT" Name="MySQL Server $(var.MYSQL_MAJOR)">
             <Directory Id="LibDir" Name="lib">
               <Directory Id="PLUGINDIR" Name="plugin" />
             </Directory>
             <Directory Id="ShareDir" Name="share">
               <Directory Id="DocDir" Name="doc">
-                <Directory Id="FractalSqlDocDir" Name="mysql-fractalsql" />
+                <Directory Id="FractalSqlDocDir" Name="fractalsql-mysql" />
               </Directory>
             </Directory>
           </Directory>
@@ -139,8 +113,8 @@
     </Directory>
 
     <!-- Each file is its own Component so uninstall removes exactly
-         the set we installed — no orphan files, no touching existing
-         MySQL files. GUIDs embed MYSQL_MAJOR_HEX so each
+         the set we installed: no orphan files, no touching existing
+         MySQL files. GUIDs embed MYSQL_MAJOR_TAG so each
          (major, file) pair is deterministic across rebuilds without
          colliding across majors. -->
 

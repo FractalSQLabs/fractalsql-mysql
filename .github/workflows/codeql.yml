@@ -1,0 +1,79 @@
+name: CodeQL
+
+# CodeQL static analysis on push/PR + weekly scheduled rescan.
+# Runs on its own schedule — completely independent of release.yml;
+# a CodeQL failure never affects a tag build or a release upload.
+#
+# Scanner output surfaces as alerts under the repo's Security tab.
+# Nothing is blocking by default. Triage is done via the Security
+# UI; alerts can be dismissed with a reason.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly rescan — picks up new CodeQL queries as GitHub ships them
+    # even when the codebase hasn't changed.
+    - cron: '17 3 * * 1'
+
+permissions:
+  # Read source; write security events.
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # src/fractalsql.c is C, plus the GitHub Actions workflows
+        # themselves benefit from the 'actions' analyzer (finds
+        # insecure workflow patterns).
+        language: [c-cpp, actions]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4187e74d05793876e9989daffde9c3e66b4acd07  # v3
+        with:
+          languages: ${{ matrix.language }}
+          # Autobuild tries to compile C/C++ automatically. If it
+          # fails (missing libmysqlclient-dev on the runner), we
+          # fall back to no-compile source scanning rather than
+          # failing the whole job.
+          build-mode: ${{ matrix.language == 'c-cpp' && 'autobuild' || 'none' }}
+
+      # Install UDF build deps so autobuild has a chance. continue-on-error
+      # so a transient apt failure doesn't block the analysis; CodeQL will
+      # still run against source-only if autobuild can't complete.
+      - name: Install build dependencies
+        if: matrix.language == 'c-cpp'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential \
+              default-libmysqlclient-dev \
+              libluajit-5.1-dev \
+              pkg-config
+
+      - name: Autobuild
+        if: matrix.language == 'c-cpp'
+        continue-on-error: true
+        uses: github/codeql-action/autobuild@4187e74d05793876e9989daffde9c3e66b4acd07  # v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@4187e74d05793876e9989daffde9c3e66b4acd07  # v3
+        with:
+          category: "/language:${{ matrix.language }}"

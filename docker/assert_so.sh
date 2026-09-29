@@ -1,5 +1,6 @@
 #!/bin/sh
-# docker/assert_so.sh — zero-dependency posture check for fractalsql.so.
+# shellcheck shell=sh  # Intentionally POSIX: runs in minimal builder stages where bash may be absent.
+# docker/assert_so.sh: zero-dependency posture check for fractalsql.so.
 #
 # Usage: assert_so.sh <path/to/fractalsql.so> <size_ceiling_bytes>
 #
@@ -64,12 +65,13 @@ if [ "${SZ}" -gt "${CEILING}" ]; then
     exit 1
 fi
 
-# Assertion 5: UDF entry points are in .dynsym. Without these, MySQL's
+# Assertion 5: UDF entry points are in .dynsym. Without these,
 # dlsym(fractal_search) fails at CREATE FUNCTION time.
 echo "--- dynsym UDF entry points ---"
 for sym in fractal_search fractal_search_init fractal_search_deinit \
-           fractalsql_edition fractalsql_edition_init fractalsql_edition_deinit \
-           fractalsql_version fractalsql_version_init fractalsql_version_deinit; do
+           fractal_search_explore fractal_search_explore_init fractal_search_explore_deinit \
+           fractal_edition fractal_edition_init fractal_edition_deinit \
+           fractal_version fractal_version_init fractal_version_deinit; do
     if ! nm -D "${SO}" 2>/dev/null | awk '{print $NF}' | grep -Fx "${sym}" >/dev/null; then
         echo "FAIL: ${sym} missing from .dynsym" >&2
         exit 1

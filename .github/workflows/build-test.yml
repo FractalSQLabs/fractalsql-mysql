@@ -1,0 +1,605 @@
+name: build-test
+
+# Public CI wrapper around run_build_test.sh / build_test.sh: the same
+# scripts a dev runs locally, so local == CI. Compiles fractalsql.so
+# once (one .so covers every supported MySQL major -- 8.4 LTS, 9.7
+# LTS, and 26.7 share a stable UDF ABI, so
+# no per-major rebuild is needed) and
+# exercises the behavioral gate suite (see build_test.sh's header for
+# exactly which gates exist and which are still pending) against a
+# throwaway cluster for every supported major on every push/PR.
+#
+# docker/Dockerfile.test runs build_test.sh --mysql <major> as a RUN
+# step, so a passing `docker build` cell IS the test result: no
+# separate `docker run` / cluster-cleanup dance in the workflow itself.
+# "9" and "26" below are the official docker image tags (mysql:9 is
+# the 9.7 LTS tag -- mysql:9.0 exists but pins the EOL 9.0 release;
+# mysql:26 currently serves 26.7.0, Oracle publishes 26.x from the
+# "26" tag, not a "26.7" tag) and
+# also build_test.sh's scratch-path labels; they are never version
+# numbers handed to a MySQL binary. Caveat inherent to "26": Oracle
+# republishes that tag for each 26.x patch, so an upstream 26.x
+# release can break this cell
+# between PRs -- treat such a failure as an upstream-drift signal, not
+# a regression introduced by the PR under test.
+#
+# Extra jobs alongside the Linux/Docker gate matrix:
+#   windows-gate-matrix: build_test.ps1 (a PowerShell port of
+#              build_test.sh) against downloads.mysql.com's per-version
+#              winx64 zip (8.4.11 / 9.7.2 / 26.7.0 pins, same as
+#              release.yml's build-windows-msi matrix -- single source
+#              of truth) on windows-latest. "9.7" is the MSI/scratch
+#              LABEL for the 9.7 LTS line and "26.7" for the 26.7
+#              line (build_test.ps1's ValidatePattern and
+#              build.bat's install paths key off them); the actual
+#              binaries are the pinned 9.7.2 / 26.7.0 publishes.
+#              Unverified as of
+#              this writing: written by direct translation from the
+#              verified-working build_test.sh but never run against a
+#              real Windows box, so this job's first real run is what
+#              will actually confirm or break it. See build_test.ps1's
+#              own .DESCRIPTION.
+#   darwin-gate-matrix: build_test.sh (the same script, unmodified) on
+#              macos-14 with Homebrew's unversioned `mysql` formula --
+#              a SINGLE cell, deliberately, unlike the Linux/Windows
+#              matrices. Homebrew has no stable per-major story for
+#              MySQL: the versioned mysql@8.4 formula is keg-only (its
+#              binaries never land on PATH, so build_test.sh's own
+#              default resolution misses it) and the unversioned
+#              `mysql` formula tracks whatever 9.7-era release is
+#              current. Since
+#              the one .so built here covers both majors and the
+#              8.4 LTS surface is already exercised by the Linux and
+#              Windows matrices, the darwin cell adds the macOS-specific
+#              gate surface (dyld plugin loading, Homebrew datadir
+#              layout) rather than a second major. The cell still
+#              drifts to a newer major when Homebrew updates the
+#              formula -- see build_test.sh's mysql_bindir comment,
+#              which documents this exact limitation.
+#   linux-asan / linux-ubsan: build_test.sh --asan / --ubsan, MySQL
+#              8.4 LTS only (the recommended ASan/UBSan
+#              representative), weekly/workflow_dispatch-only cadence.
+#              Installs 8.4 directly via Oracle's official apt repo on
+#              ubuntu-latest, not Docker, for a reason worth spelling
+#              out: LD_PRELOADing a sanitizer runtime into a
+#              full-featured official image can hang the dynamic linker
+#              on some glibc builds. It's untested whether the
+#              mysql:8.4 Docker image has that problem, so this job
+#              sidesteps it rather than assuming it's fine.
+#   windows-asan/windows-ubsan, darwin-asan/darwin-ubsan: same 8.4-
+#              only, weekly-cadence pattern as linux-asan/ubsan above.
+#              Windows note: -Asan/-Ubsan only widen build_test.ps1's
+#              own timeout budget -- there is no actual MSVC sanitizer
+#              instrumentation wired into scripts\windows\build.bat's
+#              cl.exe invocation, so these two cells currently build
+#              and run the identical DLL windows-gate-matrix's 8.4
+#              cell does, just on a longer clock. Real Windows
+#              sanitizer coverage is a separate, not-yet-done follow-up.
+#   coverage: weekly/on-demand only. A gcov-instrumented build_test.sh
+#              --coverage run, with the lcov/genhtml report uploaded as
+#              a workflow artifact. Note that the Makefile does not
+#              currently wire COVERAGE=1/ASAN=1/UBSAN=1 through to
+#              CFLAGS/LDFLAGS (see build_test.sh gate_01's own TODO
+#              comment), so this job runs today but is not yet actually
+#              measuring instrumented coverage until that Makefile gap
+#              closes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 5 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate-matrix:
+    name: build_test my${{ matrix.mysql }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # "9"/"26" = the official docker image tags (see the
+        # header comment; never handed to a MySQL binary as a version).
+        # mysql:26 is republished per 26.x patch, so its patch level
+        # can move under this cell -- see the header caveat.
+        mysql: ["8.4", "9", "26"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: docker build (runs build_test.sh --mysql ${{ matrix.mysql }})
+        run: |
+          set -euo pipefail
+          chmod +x run_build_test.sh
+          ./run_build_test.sh --mysql ${{ matrix.mysql }}
+
+  windows-gate-matrix:
+    name: build_test.ps1 my${{ matrix.mysql_major }} (Windows)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mysql_major: "8.4"
+            mysql_ver:   "8.4.11"
+          - mysql_major: "9.7"
+            mysql_ver:   "9.7.2"
+          - mysql_major: "26.7"
+            mysql_ver:   "26.7.0"
+    # Same version pins as release.yml's build-windows-msi matrix:
+    # single source of truth, don't let these drift independently.
+    # "9.7"/"26.7" are the MSI/scratch LABELS for their lines
+    # (build_test.ps1's ValidatePattern + build.bat's paths key off
+    # them); the actual binaries are the pinned 9.7.2 / 26.7.0
+    # publishes. The Downloads/MySQL-26.7/ tree carries the 26.x
+    # line's current patch, so bump mysql_ver when Oracle republishes.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Download + unpack MySQL ${{ matrix.mysql_ver }} x64 binaries
+        shell: pwsh
+        env:
+          MYSQL_VER: ${{ matrix.mysql_ver }}
+        run: |
+          # Same download sources + bot-check + PK-magic guard as
+          # release.yml's build-windows-msi job (single source of
+          # truth -- keep these in sync when one changes):
+          #   1. Archives CDN (downloads.mysql.com/archives/get/p/23/file/)
+          #   2. dev.mysql.com/get/ redirect (UA "curl/8.0" bypass).
+          # The winx64 zip contains a full mysql-<VER>-winx64\ tree
+          # with include\mysql.h DIRECTLY under include\, which
+          # build_test.ps1's Gate-01-Build compile consumes.
+          $zipName   = "mysql-${env:MYSQL_VER}-winx64.zip"
+          $majorDir = ($env:MYSQL_VER -replace '\.\d+$', '')
+          $urls = @(
+              "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
+              "https://dev.mysql.com/get/Downloads/MySQL-$majorDir/$zipName"
+          )
+          New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
+          $dest = "deps\mysql\mysql.zip"
+          $downloaded = $false
+          foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Write-Host "Fetching (attempt $attempt) $url"
+                  try {
+                      Invoke-WebRequest -Uri $url `
+                          -OutFile $dest `
+                          -UseBasicParsing `
+                          -MaximumRedirection 10 `
+                          -Headers @{ "User-Agent" = "curl/8.0" } `
+                          -TimeoutSec 300
+                  } catch {
+                      Write-Host "  -> $($_.Exception.Message)"
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  # Guard against Oracle returning a 200 OK with an HTML
+                  # error page: real zip files start with 'PK' (0x50 0x4B).
+                  $headBytes = [System.IO.File]::ReadAllBytes($dest) |
+                                 Select-Object -First 4
+                  if ($headBytes[0] -ne 0x50 -or $headBytes[1] -ne 0x4B) {
+                      Write-Host "  -> got non-ZIP payload; retrying"
+                      Remove-Item $dest -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $downloaded = $true
+                  break
+              }
+              if ($downloaded) { break }
+          }
+          if (-not $downloaded) {
+              Write-Host "FATAL: could not fetch $zipName from any mirror"
+              exit 1
+          }
+
+          Expand-Archive -Path $dest -DestinationPath "deps\mysql" -Force
+
+          $unpacked = "deps\mysql\mysql-${env:MYSQL_VER}-winx64"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            Get-ChildItem deps\mysql -Recurse -Depth 2 | Format-Table
+            exit 1
+          }
+          if (-not (Test-Path "deps\mysql\root\include\mysql.h")) {
+            Write-Host "FATAL: include\mysql.h missing from unpacked tree"
+            exit 1
+          }
+
+      # OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+      # check, not vendored by fractalsql-core. Same vcpkg tool and
+      # install path fractalsql-reasoning-http's own Windows build
+      # already uses for libcurl (pre-installed on this runner image).
+      # build_test.ps1's own Gate-01-Build (scripts\windows\build.bat
+      # under the hood) does the actual compile -- this step only needs
+      # to make sure vcpkg has the package installed first.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+
+      - name: build_test.ps1 -MysqlDir deps\mysql\root -MysqlMajor ${{ matrix.mysql_major }}
+        shell: pwsh
+        run: |
+          # -VcpkgRoot pins the vcpkg tree the step above populates:
+          # newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # pointing at it, and Resolve-VcpkgRoot's env fallback would
+          # resolve OpenSSL against that empty tree. Same drift fix as
+          # release.yml's build-windows-msi job.
+          .\build_test.ps1 -MysqlDir "deps\mysql\root" -MysqlMajor "${{ matrix.mysql_major }}" -VcpkgRoot "C:\vcpkg" -TimeoutMult 2
+          exit $LASTEXITCODE
+
+  darwin-gate-matrix:
+    name: build_test.sh (macOS, Homebrew mysql)
+    if: github.event_name != 'schedule'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: "Install MySQL (Homebrew: unversioned `mysql` formula)"
+        run: |
+          set -euo pipefail
+          # Single-cell rationale (see the workflow header): Homebrew's
+          # per-major formulae don't line up with the supported matrix
+          # -- mysql@8.4 is keg-only, so build_test.sh's default
+          # bindir resolution never finds it -- and the one .so built
+          # here covers both majors anyway. This cell exists for the
+          # macOS-specific gate surface (dyld plugin loading, Homebrew
+          # datadir layout), not for a second major.
+          # openssl@3: gate 01's `make` needs <openssl/evp.h> for
+          # fractalsql_enterprise.c (the SDK ships no OpenSSL headers,
+          # and openssl@3 is keg-only -- the Makefile resolves the keg
+          # itself via `brew --prefix openssl@3`).
+          brew install jq openssl@3 mysql
+
+      - name: build_test.sh (default MYSQL_MAJOR)
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          ./build_test.sh
+
+  linux-asan:
+    name: build_test.sh --asan my8.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL 8.4 LTS (Oracle apt repo)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq libcurl4
+          # Oracle's official apt config package; pin the 8.4-lts
+          # channel explicitly via debconf so a future
+          # mysql-apt-config default drift can't flip this cell to
+          # another major. Ubuntu's own archive has no current MySQL
+          # server major since 8.0 went EOL.
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+              | sudo debconf-set-selections
+          sudo dpkg -i mysql-apt-config_0.8.35-1_all.deb
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mysql-community-server to pull it in
+          # transitively. libmysqlclient-dev provides mysql.h +
+          # mysql_config for the same gate's compile.
+          sudo apt-get install -qq -y mysql-community-server libmysqlclient-dev libssl-dev build-essential
+
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          # The Oracle deb's postinst starts mysqld; build_test.sh
+          # brings up its own scratch instance on a different socket/
+          # port, but the distro daemon holding the default datadir
+          # confuses nothing except port bookkeeping -- stop it anyway
+          # so the scratch cluster runs alone.
+          sudo service mysql stop || true
+          ./build_test.sh --mysql 8.4 --asan
+
+  linux-ubsan:
+    name: build_test.sh --ubsan my8.4
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL 8.4 LTS (Oracle apt repo)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg jq libcurl4
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+              | sudo debconf-set-selections
+          sudo dpkg -i mysql-apt-config_0.8.35-1_all.deb
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mysql-community-server to pull it in
+          # transitively. libmysqlclient-dev provides mysql.h +
+          # mysql_config for the same gate's compile.
+          sudo apt-get install -qq -y mysql-community-server libmysqlclient-dev libssl-dev build-essential
+
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mysql stop || true
+          ./build_test.sh --mysql 8.4 --ubsan
+
+  windows-asan:
+    name: build_test.ps1 -Asan my8.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+      - name: Download + unpack MySQL 8.4.11 x64 binaries
+        shell: pwsh
+        env:
+          MYSQL_VER: "8.4.11"
+        run: |
+          # Same download sources + bot-check + PK-magic guard as the
+          # windows-gate-matrix job above (single source of truth).
+          $zipName   = "mysql-${env:MYSQL_VER}-winx64.zip"
+          $majorDir = ($env:MYSQL_VER -replace '\.\d+$', '')
+          $urls = @(
+              "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
+              "https://dev.mysql.com/get/Downloads/MySQL-$majorDir/$zipName"
+          )
+          New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
+          $dest = "deps\mysql\mysql.zip"
+          $downloaded = $false
+          foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Write-Host "Fetching (attempt $attempt) $url"
+                  try {
+                      Invoke-WebRequest -Uri $url `
+                          -OutFile $dest `
+                          -UseBasicParsing `
+                          -MaximumRedirection 10 `
+                          -Headers @{ "User-Agent" = "curl/8.0" } `
+                          -TimeoutSec 300
+                  } catch {
+                      Write-Host "  -> $($_.Exception.Message)"
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $headBytes = [System.IO.File]::ReadAllBytes($dest) |
+                                 Select-Object -First 4
+                  if ($headBytes[0] -ne 0x50 -or $headBytes[1] -ne 0x4B) {
+                      Write-Host "  -> got non-ZIP payload; retrying"
+                      Remove-Item $dest -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $downloaded = $true
+                  break
+              }
+              if ($downloaded) { break }
+          }
+          if (-not $downloaded) {
+              Write-Host "FATAL: could not fetch $zipName from any mirror"
+              exit 1
+          }
+          Expand-Archive -Path $dest -DestinationPath "deps\mysql" -Force
+          Rename-Item -Path "deps\mysql\mysql-${env:MYSQL_VER}-winx64" -NewName "root"
+          if (-not (Test-Path "deps\mysql\root\include\mysql.h")) {
+            Write-Host "FATAL: include\mysql.h missing from unpacked tree"
+            exit 1
+          }
+      # build_test.ps1's Gate-01-Build calls Build-AsanExtension itself
+      # (a real MSVC /fsanitize=address compile+link into its own
+      # dist\windows-asan\ tree, see that function's own comment) --
+      # this step only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+      - name: build_test.ps1 -Asan my8.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MysqlDir "deps\mysql\root" -MysqlMajor "8.4" -Asan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  windows-ubsan:
+    name: build_test.ps1 -Ubsan my8.4 (Windows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Set up MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+      - name: Download + unpack MySQL 8.4.11 x64 binaries
+        shell: pwsh
+        env:
+          MYSQL_VER: "8.4.11"
+        run: |
+          # Same download sources + bot-check + PK-magic guard as the
+          # windows-gate-matrix job above (single source of truth).
+          $zipName   = "mysql-${env:MYSQL_VER}-winx64.zip"
+          $majorDir = ($env:MYSQL_VER -replace '\.\d+$', '')
+          $urls = @(
+              "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
+              "https://dev.mysql.com/get/Downloads/MySQL-$majorDir/$zipName"
+          )
+          New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
+          $dest = "deps\mysql\mysql.zip"
+          $downloaded = $false
+          foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Write-Host "Fetching (attempt $attempt) $url"
+                  try {
+                      Invoke-WebRequest -Uri $url `
+                          -OutFile $dest `
+                          -UseBasicParsing `
+                          -MaximumRedirection 10 `
+                          -Headers @{ "User-Agent" = "curl/8.0" } `
+                          -TimeoutSec 300
+                  } catch {
+                      Write-Host "  -> $($_.Exception.Message)"
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $headBytes = [System.IO.File]::ReadAllBytes($dest) |
+                                 Select-Object -First 4
+                  if ($headBytes[0] -ne 0x50 -or $headBytes[1] -ne 0x4B) {
+                      Write-Host "  -> got non-ZIP payload; retrying"
+                      Remove-Item $dest -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $downloaded = $true
+                  break
+              }
+              if ($downloaded) { break }
+          }
+          if (-not $downloaded) {
+              Write-Host "FATAL: could not fetch $zipName from any mirror"
+              exit 1
+          }
+          Expand-Archive -Path $dest -DestinationPath "deps\mysql" -Force
+          Rename-Item -Path "deps\mysql\mysql-${env:MYSQL_VER}-winx64" -NewName "root"
+          if (-not (Test-Path "deps\mysql\root\include\mysql.h")) {
+            Write-Host "FATAL: include\mysql.h missing from unpacked tree"
+            exit 1
+          }
+      # build_test.ps1's Gate-01-Build calls Build-UbsanExtension itself
+      # (clang-cl + -fsanitize=undefined into its own dist\windows-ubsan\
+      # tree, see that function's own comment) -- clang-cl comes from
+      # windows-latest's bundled VS "C++ Clang tools for Windows"
+      # component, resolved via Find-ClangCl's vswhere lookup. This step
+      # only needs vcpkg to already have OpenSSL installed.
+      - name: vcpkg install openssl:x64-windows-static
+        shell: cmd
+        run: |
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
+      - name: build_test.ps1 -Ubsan my8.4
+        shell: pwsh
+        run: |
+          .\build_test.ps1 -MysqlDir "deps\mysql\root" -MysqlMajor "8.4" -Ubsan -VcpkgRoot "C:\vcpkg" -TimeoutMult 4
+          exit $LASTEXITCODE
+
+  darwin-asan:
+    name: build_test.sh --asan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MySQL (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install jq openssl@3 mysql
+      - name: build_test.sh --asan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          ./build_test.sh --asan
+
+  darwin-ubsan:
+    name: build_test.sh --ubsan (macOS)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install MySQL (Homebrew)
+        run: |
+          set -euo pipefail
+          brew install jq openssl@3 mysql
+      - name: build_test.sh --ubsan
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          ./build_test.sh --ubsan
+
+  coverage:
+    name: coverage (lcov)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL 8.4 LTS + lcov (Oracle apt repo)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y wget gnupg lcov jq libcurl4
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+              | sudo debconf-set-selections
+          sudo dpkg -i mysql-apt-config_0.8.35-1_all.deb
+          sudo apt-get update -qq
+          # libssl-dev named explicitly: gate 01's `make` links -lcrypto
+          # for fractalsql_enterprise.c's Ed25519 check, rather than
+          # leaning on mysql-community-server to pull it in
+          # transitively. libmysqlclient-dev provides mysql.h +
+          # mysql_config for the same gate's compile.
+          sudo apt-get install -qq -y mysql-community-server libmysqlclient-dev libssl-dev build-essential
+
+      - name: build_test.sh --coverage
+        run: |
+          set -euo pipefail
+          chmod +x build_test.sh
+          sudo service mysql stop || true
+          ./build_test.sh --mysql 8.4 --coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-html
+          path: coverage_html/
+          retention-days: 30
+          if-no-files-found: warn

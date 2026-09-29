@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
 #
-# scripts/package.sh — mysql-fractalsql packaging.
+# scripts/package.sh: fractalsql-mysql packaging.
 #
 # Assumes ./build.sh ${ARCH} has produced:
 #   dist/${ARCH}/fractalsql.so
 #
 # Emits one .deb and one .rpm per arch into dist/packages/:
-#   dist/packages/mysql-fractalsql-amd64.deb
-#   dist/packages/mysql-fractalsql-amd64.rpm
-#   dist/packages/mysql-fractalsql-arm64.deb
-#   dist/packages/mysql-fractalsql-arm64.rpm
+#   dist/packages/fractalsql-mysql-amd64.deb
+#   dist/packages/fractalsql-mysql-amd64.rpm
+#   dist/packages/fractalsql-mysql-arm64.deb
+#   dist/packages/fractalsql-mysql-arm64.rpm
 #
-# One binary covers MySQL 8.0 / 8.4 LTS / 9.x — the UDF ABI is stable
-# since MySQL 8.0.0, so the package depends on mysql-server generically
-# rather than pinning a specific major.
+# One binary covers MySQL 8.4 LTS, 9.7 LTS, and 26.7: the UDF ABI is
+# stable across those majors, so the
+# package depends on mysql-community-server generically rather than
+# pinning a specific major.
+#
+# One glibc profile, matching build.sh: modern glibc-2.34 only (built
+# inside rockylinux:9).
 #
 # Usage:
-#   scripts/package.sh [amd64|arm64]     # default: amd64
+#   scripts/package.sh [amd64|arm64]
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="1.0.0"
+VERSION="${FSQL_PKG_VERSION:-$(sed -n 's/^#define FSQL_VERSION "\(.*\)"$/\1/p' src/fractalsql.c)}"
+[ -n "${VERSION}" ] || { echo "could not determine VERSION (FSQL_VERSION not found in src/fractalsql.c)" >&2; exit 1; }
 ITERATION="1"
 DIST_DIR="dist/packages"
-PKG_NAME="mysql-fractalsql"
+
+# GLIBC_DEP matches the build target in build.sh: the .so compiles
+# inside rockylinux:9 (glibc 2.34).
+GLIBC_DEP="2.34"
+PKG_NAME="fractalsql-mysql"
 mkdir -p "${DIST_DIR}"
 
 # Absolute repo root, captured before any -C chdir'd fpm invocation.
 REPO_ROOT="$(pwd)"
-for f in LICENSE LICENSE-THIRD-PARTY; do
-    if [ ! -f "${REPO_ROOT}/${f}" ]; then
-        echo "missing ${REPO_ROOT}/${f} — refusing to package without it" >&2
+for f in LICENSE THIRD-PARTY-NOTICES.md; do
+    if [[ ! -f "${REPO_ROOT}/${f}" ]]; then
+        echo "missing ${REPO_ROOT}/${f}: refusing to package without it" >&2
         exit 1
     fi
 done
@@ -41,41 +50,56 @@ PKG_ARCH="${1:-amd64}"
 case "${PKG_ARCH}" in
     amd64|arm64) ;;
     *)
-        echo "unknown arch '${PKG_ARCH}' — expected amd64 or arm64" >&2
+        echo "unknown arch '${PKG_ARCH}': expected amd64 or arm64" >&2
         exit 2
         ;;
 esac
 
 case "${PKG_ARCH}" in
-    amd64) RPM_ARCH="x86_64"  ;;
-    arm64) RPM_ARCH="aarch64" ;;
+    amd64) RPM_ARCH="x86_64"  ; FSQL_PLATFORM="linux-x86_64"  ;;
+    arm64) RPM_ARCH="aarch64" ; FSQL_PLATFORM="linux-aarch64" ;;
 esac
 
 SO="dist/${PKG_ARCH}/fractalsql.so"
-if [ ! -f "${SO}" ]; then
-    echo "missing ${SO} — run ./build.sh ${PKG_ARCH} first" >&2
+if [[ ! -f "${SO}" ]]; then
+    echo "missing ${SO}: run ./build.sh ${PKG_ARCH} first" >&2
+    exit 1
+fi
+
+# The reasoning plugin (fractalsql-reasoning-http.so) is a standalone
+# dlopen'd .so, not linked into fractalsql.so itself. Cognition
+# (fractal_reason/fractal_embed), Text-to-SQL, the Vectorizer, and the
+# Agency tier are all unusable without it landing in plugin_dir
+# alongside fractalsql.so. It's vendored per-arch under include/, same
+# artifact the demo Dockerfile and the darwin release .zip already
+# ship. Links libcurl at runtime; the libcurl dependency is declared on
+# the package below rather than statically linked.
+REASONING_SO="include/${FSQL_PLATFORM}/fractalsql-reasoning-http.so"
+if [[ ! -f "${REASONING_SO}" ]]; then
+    echo "missing ${REASONING_SO}: re-run the vendored-artifact deploy step" >&2
     exit 1
 fi
 
 DEB_OUT="${DIST_DIR}/${PKG_NAME}-${PKG_ARCH}.deb"
 RPM_OUT="${DIST_DIR}/${PKG_NAME}-${PKG_ARCH}.rpm"
 
-# Build per-format staging roots. The plugin_dir mysqld actually
-# reads from differs across distros — we match each one:
+# Build per-format staging roots. mysqld's plugin_dir differs across
+# distros and we must match each one or CREATE FUNCTION will fail to
+# find the .so at runtime:
 #
-#   Debian/Ubuntu mysql-server / mysql-community-server (apt):
+#   Debian/Ubuntu mysql-community-server (Oracle's apt repo,
+#   repo.mysql.com -- Debian's own archive has not carried a current
+#   MySQL server major since 8.0 went EOL):
 #       plugin_dir = /usr/lib/mysql/plugin/
-#   RHEL/CentOS/Oracle Linux mysql-community-server (yum):
-#       plugin_dir = /usr/lib64/mysql/plugin/   (el9 RPM uses lib64)
-#
-# Shipping the .so at the wrong path means CREATE FUNCTION ...
-# SONAME 'fractalsql.so' silently fails to resolve at load time, so
-# we stage two separate trees and point fpm at the appropriate one.
-# (Verified by docker logs from the mysql:8.0 image, which is
-# 8.0.45-1.el9 and reports @@plugin_dir = /usr/lib64/mysql/plugin/.)
+#   RHEL/CentOS/Rocky Linux mysql-community-server (Oracle's yum repo,
+#   repo.mysql.com -- what install-test.yml actually installs):
+#       plugin_dir = /usr/lib64/mysql/plugin/  (confirmed live via
+#                                               SELECT @@plugin_dir on
+#                                               rockylinux:9, majors
+#                                               8.4/9.7/26)
 #
 # LICENSE ledger: staged into /usr/share/doc/<pkg>/ via install -Dm0644
-# BEFORE running fpm. Explicit fpm src=dst mappings break here — fpm's
+# BEFORE running fpm. Explicit fpm src=dst mappings break here: fpm's
 # -C chroots absolute source paths too, so ${REPO_ROOT}/LICENSE gets
 # resolved as ${STAGE}${REPO_ROOT}/LICENSE and fpm bails with
 # "Cannot chdir to ...".
@@ -89,36 +113,48 @@ stage_common() {
         "${stage}/usr/share/${PKG_NAME}/install_udf.sql"
     install -Dm0644 "${REPO_ROOT}/LICENSE" \
         "${stage}/usr/share/doc/${PKG_NAME}/LICENSE"
-    install -Dm0644 "${REPO_ROOT}/LICENSE-THIRD-PARTY" \
+    install -Dm0644 "${REPO_ROOT}/THIRD-PARTY-NOTICES.md" \
         "${stage}/usr/share/doc/${PKG_NAME}/LICENSE-THIRD-PARTY"
 }
 
 # Debian layout.
 install -Dm0755 "${SO}" \
     "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql.so"
+install -Dm0755 "${REASONING_SO}" \
+    "${STAGE_DEB}/usr/lib/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_DEB}"
 
-# RHEL layout (/usr/lib64/).
+# RHEL layout. rockylinux:9 + Oracle's mysql-community-server package
+# (repo.mysql.com, what install-test.yml installs) reports
+# @@plugin_dir = /usr/lib64/mysql/plugin/ -- confirmed live across
+# majors 8.4/9.7/26. A distro-stock mysql server package may differ; this
+# targets the Oracle repo since that's what the install-test CI (and
+# this script's own users following docs/getting-started.md) actually
+# installs.
 install -Dm0755 "${SO}" \
     "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql.so"
+install -Dm0755 "${REASONING_SO}" \
+    "${STAGE_RPM}/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so"
 stage_common "${STAGE_RPM}"
 
 echo "------------------------------------------"
 echo "Packaging ${PKG_NAME} (${PKG_ARCH})"
 echo "------------------------------------------"
 
-# LuaJIT is statically linked into fractalsql.so — no libluajit-5.1-2
-# (Debian) or luajit (RPM) runtime dependency is declared. mysql-server
-# is depended on generically: the same .so works on 8.0 / 8.4 / 9.x.
+# No LuaJIT anywhere in this build (pure-C vendored core, statically
+# linked): no libluajit-5.1-2 (Debian) or luajit (RPM) runtime
+# dependency. libcurl IS a real runtime dependency of the bundled
+# fractalsql-reasoning-http.so (dlopen-linked, not statically linked).
 fpm -s dir -t deb \
     -n "${PKG_NAME}" \
     -v "${VERSION}" \
     -a "${PKG_ARCH}" \
     --iteration "${ITERATION}" \
-    --description "FractalSQL: Stochastic Fractal Search UDF for MySQL (8.0 / 8.4 LTS / 9.x)" \
-    --license "MIT" \
-    --depends "libc6 (>= 2.38)" \
-    --depends "mysql-server | mysql-community-server | mariadb-server" \
+    --description "FractalSQL: Stochastic Fractal Search UDF for MySQL (8.4 LTS, 9.7 LTS, 26.7)" \
+    --license "Apache-2.0" \
+    --depends "libc6 (>= ${GLIBC_DEP})" \
+    --depends "libcurl4" \
+    --depends "mysql-community-server" \
     -C "${STAGE_DEB}" \
     -p "${DEB_OUT}" \
     usr
@@ -128,8 +164,9 @@ fpm -s dir -t rpm \
     -v "${VERSION}" \
     -a "${RPM_ARCH}" \
     --iteration "${ITERATION}" \
-    --description "FractalSQL: Stochastic Fractal Search UDF for MySQL (8.0 / 8.4 LTS / 9.x)" \
-    --license "MIT" \
+    --description "FractalSQL: Stochastic Fractal Search UDF for MySQL (8.4 LTS, 9.7 LTS, 26.7)" \
+    --license "Apache-2.0" \
+    --depends "libcurl.so.4()(64bit)" \
     --depends "mysql-community-server" \
     -C "${STAGE_RPM}" \
     -p "${RPM_OUT}" \

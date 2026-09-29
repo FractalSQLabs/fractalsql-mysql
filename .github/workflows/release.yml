@@ -1,4 +1,4 @@
-name: Release mysql-fractalsql Packages
+name: Release fractalsql-mysql Packages
 
 on:
   push:
@@ -12,39 +12,48 @@ env:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # ------------------------------------------------------------------
   # Linux: build fractalsql.so per arch. The UDF ABI is stable across
-  # MySQL 8.0 / 8.4 LTS / 9.x, so one .so per arch covers the whole
-  # supported range — no per-major fan-in.
+  # MySQL 8.4 LTS, 9.7 LTS, and 26.7, so
+  # one .so per arch covers the whole supported range, no per-major
+  # fan-in.
   #
-  # amd64 gets a native smoke test inside real mysql:8.0 AND mysql:8.4
-  # containers (edition + version + fractal_search cosine-similarity
-  # convergence) — same .so in, both containers out, which is the
-  # actual cross-major-ABI proof.
-  # arm64 skips the smoke test — QEMU + mysqld is too slow and flaky,
-  # and the Dockerfile's post-link assertions already validate the
-  # arm64 ABI (ldd shortlist, .dynsym exports, size ceiling).
+  # Both arches get a native smoke test inside real mysql:8.4, mysql:9,
+  # AND mysql:26 containers (edition + version + fractal_search
+  # cosine-similarity convergence), the same .so in, both containers
+  # out, which is the actual cross-major-ABI proof. The arm64 cell
+  # runs on GitHub's native ubuntu-24.04-arm runner, so its Docker
+  # images and mysqld are arm64 at full speed.
   # ------------------------------------------------------------------
   build:
     name: build ${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    # Native arm64 via GitHub's ubuntu-24.04-arm runner. Earlier
+    # iterations used ubuntu-latest + QEMU, which paid the cost of
+    # x86->aarch64 instruction translation for the entire pure-C
+    # fractalsql.so build. Native arm64 runners (GA mid-2025) run the
+    # same Docker + buildx stack at native speed; no QEMU shim needed.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
       - name: Build fractalsql.so for ${{ matrix.arch }}
         run: |
@@ -53,10 +62,9 @@ jobs:
           ls -l dist/${{ matrix.arch }}/fractalsql.so
 
       - name: Smoke test (edition/version + fractal_search convergence)
-        if: matrix.arch == 'amd64'
         run: |
           set -euo pipefail
-          SO="dist/amd64/fractalsql.so"
+          SO="dist/${{ matrix.arch }}/fractalsql.so"
 
           # Password picked to avoid any possibility that a
           # validate_password component (if the image loads it in a
@@ -77,11 +85,12 @@ jobs:
               echo "::endgroup::"
           }
 
-          # Validate the same fractalsql.so against both a current
-          # stable (8.0) and the current LTS (8.4). Same binary in,
-          # both containers out — proves the UDF ABI stability claim
-          # instead of just asserting it in commentary.
-          for TAG in 8.0 8.4; do
+          # Validate the same fractalsql.so against the LTS major (8.4),
+          # the 9.7 LTS tag (mysql:9), and the 26.7 tag (mysql:26).
+          # Same binary in, three containers
+          # out — proving the UDF ABI stability claim instead of just
+          # asserting it in commentary.
+          for TAG in 8.4 9 26; do
               M="my-${TAG}"
               echo "=============================================="
               echo "  Smoke test against mysql:${TAG}"
@@ -104,7 +113,7 @@ jobs:
               # just a TCP/socket ping — `SELECT 1` succeeds only once
               # phase 2 is fully up AND the root password matches. The
               # --protocol=socket path also sidesteps the TLS handshake
-              # MySQL 8.0+ enables on TCP by default (which produced
+              # MySQL enables on TCP by default (which produced
               # "TLS/SSL error: Broken pipe (32)" in earlier runs).
               READY=0
               for i in $(seq 1 180); do
@@ -129,12 +138,12 @@ jobs:
               MC="mysql --protocol=socket -uroot -p${MYSQL_PW}"
 
               # Discover the actual plugin_dir from the running server —
-              # don't hardcode. Oracle's mysql:8.0 image sits on Oracle
-              # Linux and uses /usr/lib64/mysql/plugin/; Debian/Ubuntu
-              # mysql-server packages use /usr/lib/mysql/plugin/; some
-              # layouts use /usr/lib/mysql/plugins/ (plural). Trusting
-              # @@plugin_dir matches whatever mysqld is actually loading
-              # from.
+              # don't hardcode. Oracle's official images sit on Oracle
+              # Linux (plugin_dir /usr/lib/mysql/plugin/); Debian/Ubuntu
+              # mysql-community-server packages use /usr/lib/mysql/plugin/
+              # too, while RHEL-family Oracle-repo server packages use
+              # /usr/lib64/mysql/plugin/. Trusting @@plugin_dir matches
+              # whatever mysqld is actually loading from.
               PLUGIN_DIR=$(docker exec "${M}" ${MC} -N -B -e \
                   "SELECT @@plugin_dir" | tr -d '\r')
               if [ -z "${PLUGIN_DIR}" ]; then
@@ -159,17 +168,26 @@ jobs:
               # docker exec without -i silently discards stdin, so the
               # UDF registration SQL never reaches the mysql client.
               # Always use docker exec -i for SQL piped from a file.
-              docker exec -i "${M}" ${MC} < sql/install_udf.sql
+              # install_udf.sql's UDF half is server-global (mysql.func,
+              # no default database needed), but its procedural half
+              # (fractal_schema_context, _fractalsql_scan_corpus, ...)
+              # are ordinary stored procedures: DROP/CREATE PROCEDURE
+              # fails with ERROR 1046 "No database selected" unless the
+              # client has a default database. Create a scratch one and
+              # select it; CREATE FUNCTION is unaffected by the choice.
+              docker exec "${M}" ${MC} \
+                  -e "CREATE DATABASE IF NOT EXISTS fractalsql_ci;"
+              docker exec -i "${M}" ${MC} -D fractalsql_ci < sql/install_udf.sql
 
               EDITION=$(docker exec "${M}" ${MC} -N -B -e \
-                  "SELECT fractalsql_edition();")
+                  "SELECT fractal_edition();")
               echo "[${TAG}] edition: ${EDITION}"
               test "${EDITION}" = "Community"
 
               VERSION=$(docker exec "${M}" ${MC} -N -B -e \
-                  "SELECT fractalsql_version();")
+                  "SELECT fractal_version();")
               echo "[${TAG}] version: ${VERSION}"
-              test "${VERSION}" = "1.0.0"
+              test "${VERSION}" = "2.0.0"
 
               # Convergence sanity check. query = (0.6, 0.8), objective
               # is cosine distance. Cosine distance is magnitude-
@@ -181,14 +199,13 @@ jobs:
               # should be essentially 1. ||query||^2 = 0.6^2+0.8^2 = 1,
               # so cos_sim simplifies to (v . query) / ||v||.
               #
-              # CONVERT(... USING utf8mb4) wrapper: MySQL 8.0+ tags UDF
+              # CONVERT(... USING utf8mb4) wrapper: MySQL tags UDF
               # STRING returns with CHARACTER SET 'binary' and then
               # JSON_EXTRACT rejects them with ERROR 3144 ("Cannot
               # create a JSON value from a string with CHARACTER SET
               # 'binary'"). Re-tagging the payload as utf8mb4 is the
               # canonical workaround; the bytes themselves are pure
-              # ASCII JSON so the conversion is a no-op. MariaDB's
-              # JSON_EXTRACT is permissive and doesn't need this.
+              # ASCII JSON so the conversion is a no-op.
               RESULT=$(docker exec "${M}" ${MC} -N -B -e "
                   SET @r = CONVERT(
                       fractal_search('', '0.6,0.8', 1,
@@ -212,9 +229,9 @@ jobs:
           done
 
       - name: Upload .so artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: mysql-fractalsql-${{ matrix.arch }}-so
+          name: fractalsql-mysql-${{ matrix.arch }}-so
           path: dist/${{ matrix.arch }}/fractalsql.so
           if-no-files-found: error
 
@@ -234,12 +251,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Download fractalsql.so
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: mysql-fractalsql-${{ matrix.arch }}-so
+          name: fractalsql-mysql-${{ matrix.arch }}-so
           path: dist/${{ matrix.arch }}
 
       - name: Install Packaging Tools
@@ -283,49 +300,52 @@ jobs:
           for deb in dist/packages/*-${{ matrix.arch }}.deb; do
               echo "=== ${deb} ==="
               CONTENTS=$(dpkg-deb -c "${deb}")
-              echo "${CONTENTS}" | grep -E 'usr/share/doc/mysql-fractalsql/LICENSE$'
-              echo "${CONTENTS}" | grep -E 'usr/share/doc/mysql-fractalsql/LICENSE-THIRD-PARTY$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mysql/LICENSE$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/fractalsql-mysql/LICENSE-THIRD-PARTY$'
           done
           for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
               echo "=== ${rpm} ==="
               CONTENTS=$(rpm -qlp "${rpm}")
-              echo "${CONTENTS}" | grep -E '/usr/share/doc/mysql-fractalsql/LICENSE$'
-              echo "${CONTENTS}" | grep -E '/usr/share/doc/mysql-fractalsql/LICENSE-THIRD-PARTY$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mysql/LICENSE$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/fractalsql-mysql/LICENSE-THIRD-PARTY$'
           done
 
       - name: Verify plugin .so lands at the right per-distro path
         run: |
-          # The .so must land where each distro's mysql-server package
-          # sets plugin_dir — otherwise CREATE FUNCTION ... SONAME
-          # 'fractalsql.so' silently fails to load.
-          #   Debian/Ubuntu:  /usr/lib/mysql/plugin/
-          #   RHEL/EL9:       /usr/lib64/mysql/plugin/
-          # CI caught the latent mismatch when the mysql:8.0 image
-          # (Oracle Linux 9 build, 8.0.45-1.el9) reported
-          # @@plugin_dir = /usr/lib64/mysql/plugin/ and the old staging
-          # dropped the .so at /usr/lib/ only.
+          # mysqld reads from different plugin_dir paths depending on
+          # distro. The .so must land where the running server actually
+          # looks or CREATE FUNCTION ... SONAME 'fractalsql.so' silently
+          # fails to load.
+          #   Debian/Ubuntu (Oracle apt repo): /usr/lib/mysql/plugin/
+          #   RHEL/EL9 (Oracle yum repo):      /usr/lib64/mysql/plugin/
+          #     (what install-test.yml installs; confirmed live via
+          #      SELECT @@plugin_dir on rockylinux:9, majors 8.4/9.7/26)
           set -euo pipefail
           for deb in dist/packages/*-${{ matrix.arch }}.deb; do
               echo "=== ${deb} ==="
               dpkg-deb -c "${deb}" \
                   | grep -E 'usr/lib/mysql/plugin/fractalsql\.so$'
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql-reasoning-http\.so$'
           done
           for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
               echo "=== ${rpm} ==="
               rpm -qlp "${rpm}" \
                   | grep -E '/usr/lib64/mysql/plugin/fractalsql\.so$'
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql-reasoning-http\.so$'
           done
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: mysql-fractalsql-${{ matrix.arch }}
+          name: fractalsql-mysql-${{ matrix.arch }}
           path: dist/packages/*
           if-no-files-found: error
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/packages/*
           fail_on_unmatched_files: false
@@ -333,48 +353,375 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ------------------------------------------------------------------
+  # macOS: fractalsql.dylib for Apple Silicon (native) + Intel
+  # (cross-compiled), pure-C, vendored core archive, zero-dependency
+  # posture. Static-links include/darwin-<arch>/
+  # libfractalsql-community-sovereign-c.a, the same vendored core
+  # archive the Linux build links.
+  #
+  # Both cells run on macos-14, since GitHub retired the free macos-13
+  # (Intel) runner in Dec 2025, so amd64 is a cross-compile
+  # (`-arch x86_64`) on the arm64 runner rather than a native build.
+  # No `-bundle_loader`/dynamic-lookup workaround is needed: this is a
+  # plain `-dynamiclib` link with no loader-provided symbol resolution
+  # to worry about, and the vendored core archive is a real per-arch
+  # static lib (not a host binary), so cross-linking it from either
+  # runner arch just works.
+  #
+  # `brew install mysql-client` supplies mysql.h (UDF headers) and
+  # mysql_config; no client library is linked (see the compile line
+  # below: only libcrypto + libc/libm/pthread, matching the Linux/
+  # Windows builds). plugin_dir varies across Homebrew arch + install
+  # path, so this ships .dylib + a README and lets the user (or
+  # install.sh) `cp` it to `SELECT @@plugin_dir`.
+  #
+  # Unsigned release: users run `xattr -d com.apple.quarantine` once.
+  # ------------------------------------------------------------------
+  build-macos:
+    name: macos ${{ matrix.platform_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform_tag: osx_amd64
+          - arch: arm64
+            platform_tag: osx_arm64
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install MySQL client headers
+        run: |
+          set -euo pipefail
+          # mysql-client ships the UDF headers and mysql_config without
+          # pulling in the server. Good enough for a UDF build on a CI
+          # runner that doesn't run mysqld.
+          # openssl@3 for fractalsql_enterprise.c's Ed25519 signature
+          # check (the macOS SDK ships no OpenSSL headers; linked
+          # statically in the compile step below).
+          brew install mysql-client pkg-config openssl@3
+          # mysql-client is keg-only: nothing is linked into the default
+          # prefix, so mysql_config is not on PATH by default.
+          echo "$(brew --prefix mysql-client)/bin" >> "$GITHUB_PATH"
+
+      # The macos-14 runner is arm64, so arm-Homebrew's openssl@3 keg
+      # contains only arm64 objects; linking them into an -arch x86_64
+      # build makes ld discard every member ("found architecture
+      # 'arm64', required architecture 'x86_64'") and all EVP symbols
+      # go undefined. Homebrew also no longer ships x86_64 bottles
+      # (Intel support discontinued -- a Rosetta brew install compiles
+      # from source under emulation, ~20 minutes, on a platform Apple,
+      # GitHub and Homebrew are all sunsetting). Cross-compile an
+      # x86_64 libcrypto natively instead: clang -arch x86_64 emits
+      # x86_64 objects at full speed on the arm64 host, no Rosetta
+      # needed, since only the archive is linked and its binaries are
+      # never run.
+      - name: Cross-build x86_64 libcrypto from source
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
+          echo "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2  openssl-3.5.8.tar.gz" | shasum -a 256 -c -
+          tar xf openssl-3.5.8.tar.gz
+          cd openssl-3.5.8
+          ./Configure darwin64-x86_64 no-shared no-tests \
+              --prefix=/tmp/openssl-x64 \
+              -mmacosx-version-min=11.0 -fPIC
+          # opensslv.h and friends are generated at build time, not
+          # shipped in the tarball. Serially force the header-generation
+          # step first: kicking straight into a parallel libcrypto.a
+          # build races it, and the first .o compiles fail with
+          # "fatal error: 'openssl/opensslv.h' file not found".
+          make -j1 -s build_generated
+          make -j"$(sysctl -n hw.ncpu)" -s libcrypto.a
+          make -s install_sw
+
+      - name: Verify vendored core archive is present
+        run: |
+          set -euo pipefail
+          CORE_A="include/darwin-${{ matrix.arch }}/libfractalsql-community-sovereign-c.a"
+          test -f "${CORE_A}" \
+              || (echo "ERROR: vendored core archive missing: ${CORE_A}" >&2 \
+                  && echo "  Refresh from foundry:" >&2 \
+                  && echo "    cd ../fractalsql-core && ./scripts/deploy.sh --experimental --git fractalsql-mysql" >&2 \
+                  && exit 1)
+
+      - name: Compile fractalsql.dylib
+        run: |
+          set -euo pipefail
+          OUT_DIR="dist/${{ matrix.platform_tag }}"
+          mkdir -p "${OUT_DIR}"
+          # OpenSSL (static) for fractalsql_enterprise.c's Ed25519
+          # signature check, same linkage as the Windows build. macOS
+          # ships no OpenSSL headers in its SDK and Homebrew's openssl@3
+          # is keg-only, so point the compile at the OpenSSL tree
+          # explicitly and link its libcrypto.a statically -- the otool
+          # posture check below would reject a dynamic libcrypto
+          # dependency. The tree must match the -arch being built:
+          # x86_64 uses the cross-compiled tree (see the source-build
+          # step above), arm64 uses the runner's own arm-Homebrew keg.
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              OPENSSL_DIR="/tmp/openssl-x64"
+          else
+              OPENSSL_DIR="$(brew --prefix openssl@3)"
+          fi
+          MYSQL_CFLAGS="$(mysql_config --cflags)"
+          echo "MYSQL_CFLAGS: ${MYSQL_CFLAGS}"
+          echo "OPENSSL_DIR: ${OPENSSL_DIR}"
+          CORE_A="include/darwin-${{ matrix.arch }}/libfractalsql-community-sovereign-c.a"
+          clang -Wall -Wextra -O3 -fPIC \
+              -arch ${{ matrix.arch }} \
+              ${MYSQL_CFLAGS} \
+              -Iinclude \
+              -I"${OPENSSL_DIR}/include" \
+              -ffunction-sections -fdata-sections -fvisibility=default \
+              -dynamiclib \
+              -Wl,-dead_strip \
+              -o "${OUT_DIR}/fractalsql.dylib" \
+              src/fractalsql.c \
+              src/fractalsql_parse.c \
+              src/fractalsql_session.c \
+              src/fractalsql_vector.c \
+              src/fractalsql_cognition.c \
+              src/fractalsql_textsql.c \
+              src/fractalsql_enterprise.c \
+              "${CORE_A}" \
+              "${OPENSSL_DIR}/lib/libcrypto.a" \
+              -lm -lpthread
+          ls -l "${OUT_DIR}/fractalsql.dylib"
+
+      - name: Posture checks (otool, size, exports)
+        run: |
+          set -euo pipefail
+          DYLIB="dist/${{ matrix.platform_tag }}/fractalsql.dylib"
+
+          echo "--- otool -L ---"
+          otool -L "${DYLIB}"
+          # tail drops the "path:" header; the self-name filter drops
+          # the dylib's own LC_ID_DYLIB entry, which otool -L also
+          # prints (install name = the -o output path) and which is
+          # not a real dependency.
+          BAD=$(otool -L "${DYLIB}" \
+                  | tail -n +2 \
+                  | awk '{print $1}' \
+                  | grep -v 'fractalsql\.dylib$' \
+                  | grep -vE '^(/usr/lib/libSystem\.B\.dylib|/usr/lib/libc\+\+\.1\.dylib|/usr/lib/libresolv\.[0-9]+\.dylib|/System/Library/Frameworks/)' \
+                  | grep -v '^$' || true)
+          if [ -n "${BAD}" ]; then
+              echo "FAIL: disallowed dynamic deps:" >&2
+              echo "${BAD}" >&2
+              exit 1
+          fi
+
+          echo "--- size ---"
+          SZ=$(stat -f '%z' "${DYLIB}")
+          echo "size: ${SZ} bytes"
+          # Unlike the Linux .so (whose 3 MiB ceiling still holds --
+          # there libcrypto resolves from mysqld at load time, see
+          # THIRD-PARTY-NOTICES.md), the macOS dylib statically bundles
+          # libcrypto.a for the Ed25519 signature check, which alone
+          # contributes ~1.4 MiB of EVP/provider machinery that
+          # -dead_strip cannot reach. 6 MiB leaves headroom for the
+          # core archive while still catching runaway bloat.
+          if [ "${SZ}" -gt 6291456 ]; then
+              echo "FAIL: dylib exceeds 6 MiB ceiling" >&2
+              exit 1
+          fi
+
+          echo "--- required exports ---"
+          # Covers every UDF currently in sql/install_udf.sql. Extend
+          # this list whenever sql/install_udf.sql adds a new
+          # CREATE FUNCTION entry. Matches the Windows posture check's
+          # list below.
+          for sym in _fractal_search _fractal_search_init _fractal_search_deinit \
+                     _fractal_search_explore _fractal_search_explore_init _fractal_search_explore_deinit \
+                     _fractal_edition _fractal_edition_init _fractal_edition_deinit \
+                     _fractal_version _fractal_version_init _fractal_version_deinit \
+                     _fractal_dimension_dfa _fractal_dimension_dfa_init _fractal_dimension_dfa_deinit \
+                     _fractal_dimension_boxcount _fractal_dimension_boxcount_init _fractal_dimension_boxcount_deinit \
+                     _fractal_dimension_drift _fractal_dimension_drift_init _fractal_dimension_drift_deinit \
+                     _fractal_optimize_portfolio _fractal_optimize_portfolio_init _fractal_optimize_portfolio_deinit \
+                     _fractal_vascular_network _fractal_vascular_network_init _fractal_vascular_network_deinit \
+                     _fractal_cortical_folding _fractal_cortical_folding_init _fractal_cortical_folding_deinit \
+                     _fractal_nerve_plexus_metric _fractal_nerve_plexus_metric_init _fractal_nerve_plexus_metric_deinit \
+                     _fractal_morphological_complexity _fractal_morphological_complexity_init _fractal_morphological_complexity_deinit \
+                     _fractal_diversify_enable _fractal_diversify_enable_init _fractal_diversify_enable_deinit \
+                     _fractal_diversify_disable _fractal_diversify_disable_init _fractal_diversify_disable_deinit \
+                     _fractal_diversify_set_params _fractal_diversify_set_params_init _fractal_diversify_set_params_deinit \
+                     _fractal_detect_collapse _fractal_detect_collapse_init _fractal_detect_collapse_deinit \
+                     _fractal_explain_result _fractal_explain_result_init _fractal_explain_result_deinit \
+                     _fractal_session_close _fractal_session_close_init _fractal_session_close_deinit \
+                     _fractal_vector_dims _fractal_vector_dims_init _fractal_vector_dims_deinit \
+                     _fractal_vector_norm _fractal_vector_norm_init _fractal_vector_norm_deinit \
+                     _fractal_vector_normalize _fractal_vector_normalize_init _fractal_vector_normalize_deinit \
+                     _fractal_vector_add _fractal_vector_add_init _fractal_vector_add_deinit \
+                     _fractal_vector_sub _fractal_vector_sub_init _fractal_vector_sub_deinit \
+                     _fractal_vector_scale _fractal_vector_scale_init _fractal_vector_scale_deinit \
+                     _fractal_vector_l2_distance _fractal_vector_l2_distance_init _fractal_vector_l2_distance_deinit \
+                     _fractal_vector_l2_squared _fractal_vector_l2_squared_init _fractal_vector_l2_squared_deinit \
+                     _fractal_vector_cosine_distance _fractal_vector_cosine_distance_init _fractal_vector_cosine_distance_deinit \
+                     _fractal_vector_cosine_similarity _fractal_vector_cosine_similarity_init _fractal_vector_cosine_similarity_deinit \
+                     _fractal_vector_negative_inner_product _fractal_vector_negative_inner_product_init _fractal_vector_negative_inner_product_deinit \
+                     _fractal_vector_from_float8_array _fractal_vector_from_float8_array_init _fractal_vector_from_float8_array_deinit \
+                     _fractal_vector_to_float8_array _fractal_vector_to_float8_array_init _fractal_vector_to_float8_array_deinit \
+                     _fractal_reason _fractal_reason_init _fractal_reason_deinit \
+                     _fractal_embed _fractal_embed_init _fractal_embed_deinit \
+                     _fractal_t2s_config _fractal_t2s_config_init _fractal_t2s_config_deinit \
+                     _fractal_t2s_generate _fractal_t2s_generate_init _fractal_t2s_generate_deinit \
+                     _fractal_t2s_review _fractal_t2s_review_init _fractal_t2s_review_deinit \
+                     _fractal_t2s_check_allowlist _fractal_t2s_check_allowlist_init _fractal_t2s_check_allowlist_deinit \
+                     _fractal_feedback_report _fractal_feedback_report_init _fractal_feedback_report_deinit \
+                     _fractal_isolate_background _fractal_isolate_background_init _fractal_isolate_background_deinit \
+                     _fractal_ledger_flush _fractal_ledger_flush_init _fractal_ledger_flush_deinit \
+                     _fractal_ledger_load _fractal_ledger_load_init _fractal_ledger_load_deinit \
+                     _fractal_ledger_compact _fractal_ledger_compact_init _fractal_ledger_compact_deinit \
+                     _fractal_ledger_reset_soft _fractal_ledger_reset_soft_init _fractal_ledger_reset_soft_deinit \
+                     _fractal_ledger_reset_hard _fractal_ledger_reset_hard_init _fractal_ledger_reset_hard_deinit \
+                     _fractal_ledger_truth_count _fractal_ledger_truth_count_init _fractal_ledger_truth_count_deinit \
+                     _fractal_ledger_shadow_count _fractal_ledger_shadow_count_init _fractal_ledger_shadow_count_deinit \
+                     _fractal_audit_unpack _fractal_audit_unpack_init _fractal_audit_unpack_deinit; do
+              nm -gU "${DYLIB}" | grep -E "${sym}$" \
+                  || { echo "FAIL: ${sym} missing"; exit 1; }
+          done
+          echo "ok: ${DYLIB}"
+
+      - name: Package .zip
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist/packages"
+          mkdir -p "${DIST_DIR}"
+          ZIP_NAME="fractalsql-mysql-${{ matrix.platform_tag }}.zip"
+          STAGE="$(mktemp -d)"
+          cp "dist/${{ matrix.platform_tag }}/fractalsql.dylib" "${STAGE}/"
+          # install -m 0755, not cp: ships the plugin with the exec bit
+          # set in the zip itself so a manual "step 3" cp from an
+          # unpacked archive can't stage a non-executable .so (macOS
+          # dyld refuses to mmap(PROT_EXEC) one; install.sh below
+          # re-stages 0755 regardless, this keeps the raw zip right).
+          install -m 0755 "include/darwin-${{ matrix.arch }}/fractalsql-reasoning-http.so" "${STAGE}/"
+          cp LICENSE "${STAGE}/"
+          cp THIRD-PARTY-NOTICES.md "${STAGE}/THIRD-PARTY-NOTICES.md"
+          cp sql/install_udf.sql "${STAGE}/install_udf.sql"
+          cp sql/install_agents.sql "${STAGE}/install_agents.sql"
+          install -m 0755 scripts/macos/install.sh "${STAGE}/install.sh"
+          cat > "${STAGE}/README.txt" <<EOF
+          fractalsql-mysql 2.0.0 Community (${{ matrix.platform_tag }})
+
+          Unsigned MySQL UDF for macOS. Compatible with MySQL 8.4 LTS
+          and 9.7 LTS via Homebrew (`mysql`, `mysql@8.4`).
+
+          Automated: run ./install.sh (uses mysql on PATH, or
+          MYSQL_BIN=/path/to/mysql ./install.sh for a specific client).
+          It does steps 1-3 and 5-6 below for you.
+
+          Manual steps, if you'd rather not run install.sh:
+
+          1. Find your mysqld's plugin_dir:
+                 mysql -uroot -p -e "SELECT @@plugin_dir;"
+             Typical on macOS (Homebrew):
+                 /opt/homebrew/opt/mysql/lib/plugin/   (Apple Silicon)
+                 /usr/local/opt/mysql/lib/plugin/       (Intel)
+
+          2. Copy the dylib there as 'fractalsql.so' (CREATE FUNCTION
+             ... SONAME references the .so name; macOS loader still
+             picks up the dylib under that name):
+                 sudo cp fractalsql.dylib \\
+                     /opt/homebrew/opt/mysql/lib/plugin/fractalsql.so
+
+          3. (Optional) Copy the reasoning plugin alongside it, needed
+             for fractal_reason()/fractal_embed()/text-to-sql, see
+             docs/reasoning-setup.md:
+                 sudo cp fractalsql-reasoning-http.so \\
+                     /opt/homebrew/opt/mysql/lib/plugin/fractalsql-reasoning-http.so
+
+          4. Clear Gatekeeper quarantine:
+                 sudo xattr -d com.apple.quarantine \\
+                     /opt/homebrew/opt/mysql/lib/plugin/fractalsql.so \\
+                     /opt/homebrew/opt/mysql/lib/plugin/fractalsql-reasoning-http.so
+
+          5. Register the UDFs and agent procedures (the database is
+             needed because the scripts also CREATE PROCEDURE):
+                 mysql -uroot -p mydb < install_udf.sql
+                 mysql -uroot -p mydb < install_agents.sql
+
+          6. Verify:
+                 mysql -uroot -p -e "SELECT fractal_edition(), fractal_version();"
+          EOF
+          ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
+          rm -rf "${STAGE}"
+          ls -l "${DIST_DIR}/${ZIP_NAME}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fractalsql-mysql-${{ matrix.platform_tag }}
+          path: dist/packages/fractalsql-mysql-${{ matrix.platform_tag }}.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          files: dist/packages/fractalsql-mysql-${{ matrix.platform_tag }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
   # Windows: fractalsql.dll + FractalSQL-MySQL-<MAJOR>-<VER>-x64.msi
   #
-  # Matrix — x64 only.
+  # Matrix: x64 only.
   #   x86   : Oracle does not publish 32-bit Windows server binaries
   #           on the current MySQL majors (8.0+), so there's no host
   #           server for a 32-bit UDF DLL.
   #   arm64 : Oracle does not yet ship Windows ARM64 server binaries
-  #           in an extractable .zip form on 8.x/9.x — deferring this
+  #           in an extractable .zip form on 8.4/9.7/26.7 — deferring
+  #           this
   #           cell per the brief ("defer rather than half-implement").
-  #   x64   : full coverage for 8.0 / 8.4 LTS / 9.x via the official
-  #           downloads.mysql.com mysql-<VER>-winx64.zip publishes.
+  #   x64   : full coverage for 8.4 LTS, 9.7 LTS, and 26.7 via the
+  #           official downloads.mysql.com mysql-<VER>-winx64.zip
+  #           publishes.
   #
-  # The minor versions pinned below (8.0.41 etc.) are current as of
-  # the first tagged release; bump MYSQL_VER when rolling forward.
-  # If a pin goes stale (downloads.mysql.com 404s), CI fails at the
-  # download step.
+  # "9.7"/"26.7" in the matrix below are the MSI/scratch LABELS for
+  # their lines (build.bat/build-msi.bat key UpgradeCodes and install
+  # paths off them, dotted labels are filesystem-safe); the actual
+  # binaries the cells build and test against are the pinned 9.7.2 /
+  # 26.7.0 publishes.
+  #
+  # The minor versions pinned below (8.4.11 / 9.7.2 / 26.7.0) are
+  # current as of this port; bump MYSQL_VER when Oracle publishes the
+  # next patch. If a pin goes stale (downloads.mysql.com 404s), CI
+  # fails at the download step.
   # ------------------------------------------------------------------
   build-windows-msi:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - mysql_major: "8.0"
-            mysql_ver:   "8.0.41"
-            arch: x64
-            runner: windows-latest
           - mysql_major: "8.4"
-            mysql_ver:   "8.4.4"
+            mysql_ver:   "8.4.11"
             arch: x64
             runner: windows-latest
-          - mysql_major: "9.1"
-            mysql_ver:   "9.1.0"
+          - mysql_major: "9.7"
+            mysql_ver:   "9.7.2"
+            arch: x64
+            runner: windows-latest
+          - mysql_major: "26.7"
+            mysql_ver:   "26.7.0"
             arch: x64
             runner: windows-latest
     runs-on: ${{ matrix.runner }}
     name: windows my${{ matrix.mysql_major }} / ${{ matrix.arch }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Set up MSVC dev cmd (${{ matrix.arch }})
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
         with:
           arch: ${{ matrix.arch }}
 
@@ -410,19 +757,6 @@ jobs:
           Write-Host "WiX bin dir: $wixBin"
           Add-Content -Path $env:GITHUB_PATH -Value $wixBin
 
-      - name: Clone + build static LuaJIT 2.1 with MSVC
-        shell: cmd
-        run: |
-          if not exist deps mkdir deps
-          git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git deps\LuaJIT
-          cd deps\LuaJIT\src
-          call msvcbuild.bat static
-          if not exist lua51.lib (
-            echo ==^> LuaJIT static build failed
-            exit /b 1
-          )
-          dir lua51.lib lua.h
-
       - name: Download + unpack MySQL ${{ matrix.mysql_ver }} ${{ matrix.arch }} binaries
         shell: pwsh
         env:
@@ -431,8 +765,9 @@ jobs:
         run: |
           # Oracle hosts per-version winx64 zips that contain a full
           # mysql-<VER>-winx64\ tree including include\ with the UDF
-          # headers. UDFs do not need a server import lib — the server
-          # loads the DLL and calls the exported entry points by name.
+          # headers (mysql.h DIRECTLY under include\). UDFs do not
+          # need a server import lib — the server loads the DLL and
+          # calls the exported entry points by name.
           #
           # Download sources (tried in order):
           #   1. Archives CDN (downloads.mysql.com/archives/get/p/23/file/)
@@ -444,9 +779,12 @@ jobs:
           #      clients hit it without a session cookie, so this URL is
           #      only a fallback.
           $zipName   = "mysql-${env:MYSQL_VER}-winx64.zip"
+          # The get/ fallback's directory segment is derived from the
+          # pinned VERSION (e.g. 9.7), not the MSI label above.
+          $majorDir = ($env:MYSQL_VER -replace '\.\d+$', '')
           $urls = @(
               "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
-              "https://dev.mysql.com/get/Downloads/MySQL-${env:MYSQL_MAJOR}/$zipName"
+              "https://dev.mysql.com/get/Downloads/MySQL-$majorDir/$zipName"
           )
           New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
           $dest = "deps\mysql\mysql.zip"
@@ -513,11 +851,22 @@ jobs:
         shell: cmd
         env:
           MYSQL_MAJOR: ${{ matrix.mysql_major }}
+          # Newer runner images ship VS-bundled vcpkg with VCPKG_ROOT
+          # (and VCPKG_INSTALLATION_ROOT) pointing at it -- an install
+          # tree that has no OpenSSL and that build.bat would then
+          # resolve OPENSSL_DIR against. Pin VCPKG_ROOT to the
+          # pre-installed C:\vcpkg the install below actually populates.
+          VCPKG_ROOT: 'C:\vcpkg'
         run: |
-          set LUAJIT_DIR=%CD%\deps\LuaJIT\src
           set MYSQL_DIR=%CD%\deps\mysql\root
           set OUT_DIR=%CD%\dist\windows\my%MYSQL_MAJOR%
           if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          REM OpenSSL (static) for fractalsql_enterprise.c's Ed25519 signature
+          REM check, not vendored by fractalsql-core. Same vcpkg tool and
+          REM install path fractalsql-reasoning-http's own Windows build
+          REM already uses for libcurl (pre-installed on this runner image).
+          C:\vcpkg\vcpkg.exe install openssl:x64-windows-static
+          if errorlevel 1 exit /b 1
           call scripts\windows\build.bat
           if errorlevel 1 exit /b 1
           dir "%OUT_DIR%\fractalsql.dll"
@@ -535,10 +884,10 @@ jobs:
               exit 1
           }
           if ($deps -match 'lua51\.dll|libluajit') {
-              Write-Host '==> FAIL: .dll depends on a dynamic LuaJIT'
+              Write-Host '==> FAIL: .dll depends on LuaJIT (pure-C vendored core migration regressed)'
               exit 1
           }
-          Write-Host '==> OK: static CRT + static LuaJIT posture'
+          Write-Host '==> OK: static CRT, no LuaJIT dependency'
 
       - name: Verify UDF entry points exported (dumpbin /exports)
         shell: pwsh
@@ -548,10 +897,58 @@ jobs:
           $dll = "dist\windows\my${env:MYSQL_MAJOR}\fractalsql.dll"
           $exports = dumpbin /exports $dll
           Write-Host ($exports -join "`n")
+          # Covers every UDF currently in sql/install_udf.sql. Extend
+          # this list whenever sql/install_udf.sql adds a new
+          # CREATE FUNCTION entry; matches the macOS posture check's
+          # list above.
           foreach ($sym in @(
                 'fractal_search','fractal_search_init','fractal_search_deinit',
-                'fractalsql_edition','fractalsql_edition_init','fractalsql_edition_deinit',
-                'fractalsql_version','fractalsql_version_init','fractalsql_version_deinit')) {
+                'fractal_search_explore','fractal_search_explore_init','fractal_search_explore_deinit',
+                'fractal_edition','fractal_edition_init','fractal_edition_deinit',
+                'fractal_version','fractal_version_init','fractal_version_deinit',
+                'fractal_dimension_dfa','fractal_dimension_dfa_init','fractal_dimension_dfa_deinit',
+                'fractal_dimension_boxcount','fractal_dimension_boxcount_init','fractal_dimension_boxcount_deinit',
+                'fractal_dimension_drift','fractal_dimension_drift_init','fractal_dimension_drift_deinit',
+                'fractal_optimize_portfolio','fractal_optimize_portfolio_init','fractal_optimize_portfolio_deinit',
+                'fractal_vascular_network','fractal_vascular_network_init','fractal_vascular_network_deinit',
+                'fractal_cortical_folding','fractal_cortical_folding_init','fractal_cortical_folding_deinit',
+                'fractal_nerve_plexus_metric','fractal_nerve_plexus_metric_init','fractal_nerve_plexus_metric_deinit',
+                'fractal_morphological_complexity','fractal_morphological_complexity_init','fractal_morphological_complexity_deinit',
+                'fractal_diversify_enable','fractal_diversify_enable_init','fractal_diversify_enable_deinit',
+                'fractal_diversify_disable','fractal_diversify_disable_init','fractal_diversify_disable_deinit',
+                'fractal_diversify_set_params','fractal_diversify_set_params_init','fractal_diversify_set_params_deinit',
+                'fractal_detect_collapse','fractal_detect_collapse_init','fractal_detect_collapse_deinit',
+                'fractal_explain_result','fractal_explain_result_init','fractal_explain_result_deinit',
+                'fractal_session_close','fractal_session_close_init','fractal_session_close_deinit',
+                'fractal_vector_dims','fractal_vector_dims_init','fractal_vector_dims_deinit',
+                'fractal_vector_norm','fractal_vector_norm_init','fractal_vector_norm_deinit',
+                'fractal_vector_normalize','fractal_vector_normalize_init','fractal_vector_normalize_deinit',
+                'fractal_vector_add','fractal_vector_add_init','fractal_vector_add_deinit',
+                'fractal_vector_sub','fractal_vector_sub_init','fractal_vector_sub_deinit',
+                'fractal_vector_scale','fractal_vector_scale_init','fractal_vector_scale_deinit',
+                'fractal_vector_l2_distance','fractal_vector_l2_distance_init','fractal_vector_l2_distance_deinit',
+                'fractal_vector_l2_squared','fractal_vector_l2_squared_init','fractal_vector_l2_squared_deinit',
+                'fractal_vector_cosine_distance','fractal_vector_cosine_distance_init','fractal_vector_cosine_distance_deinit',
+                'fractal_vector_cosine_similarity','fractal_vector_cosine_similarity_init','fractal_vector_cosine_similarity_deinit',
+                'fractal_vector_negative_inner_product','fractal_vector_negative_inner_product_init','fractal_vector_negative_inner_product_deinit',
+                'fractal_vector_from_float8_array','fractal_vector_from_float8_array_init','fractal_vector_from_float8_array_deinit',
+                'fractal_vector_to_float8_array','fractal_vector_to_float8_array_init','fractal_vector_to_float8_array_deinit',
+                'fractal_reason','fractal_reason_init','fractal_reason_deinit',
+                'fractal_embed','fractal_embed_init','fractal_embed_deinit',
+                'fractal_t2s_config','fractal_t2s_config_init','fractal_t2s_config_deinit',
+                'fractal_t2s_generate','fractal_t2s_generate_init','fractal_t2s_generate_deinit',
+                'fractal_t2s_review','fractal_t2s_review_init','fractal_t2s_review_deinit',
+                'fractal_t2s_check_allowlist','fractal_t2s_check_allowlist_init','fractal_t2s_check_allowlist_deinit',
+                'fractal_feedback_report','fractal_feedback_report_init','fractal_feedback_report_deinit',
+                'fractal_isolate_background','fractal_isolate_background_init','fractal_isolate_background_deinit',
+                'fractal_ledger_flush','fractal_ledger_flush_init','fractal_ledger_flush_deinit',
+                'fractal_ledger_load','fractal_ledger_load_init','fractal_ledger_load_deinit',
+                'fractal_ledger_compact','fractal_ledger_compact_init','fractal_ledger_compact_deinit',
+                'fractal_ledger_reset_soft','fractal_ledger_reset_soft_init','fractal_ledger_reset_soft_deinit',
+                'fractal_ledger_reset_hard','fractal_ledger_reset_hard_init','fractal_ledger_reset_hard_deinit',
+                'fractal_ledger_truth_count','fractal_ledger_truth_count_init','fractal_ledger_truth_count_deinit',
+                'fractal_ledger_shadow_count','fractal_ledger_shadow_count_init','fractal_ledger_shadow_count_deinit',
+                'fractal_audit_unpack','fractal_audit_unpack_init','fractal_audit_unpack_deinit')) {
               if (-not ($exports -match "\b$sym\b")) {
                   Write-Host "==> FAIL: $sym missing from export table"
                   exit 1
@@ -570,15 +967,15 @@ jobs:
           dir dist\windows\*.msi
 
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: mysql-fractalsql-windows-my${{ matrix.mysql_major }}-${{ matrix.arch }}
+          name: fractalsql-mysql-windows-my${{ matrix.mysql_major }}-${{ matrix.arch }}
           path: dist/windows/FractalSQL-MySQL-${{ matrix.mysql_major }}-*-${{ matrix.arch }}.msi
           if-no-files-found: error
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/windows/FractalSQL-MySQL-${{ matrix.mysql_major }}-*-${{ matrix.arch }}.msi
           fail_on_unmatched_files: false

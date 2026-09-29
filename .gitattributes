@@ -1,0 +1,7 @@
+# Normalize line endings: LF in the repository for all text files.
+* text=auto eol=lf
+
+# Windows scripts and documents that must keep CRLF on checkout.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.rtf text eol=crlf
