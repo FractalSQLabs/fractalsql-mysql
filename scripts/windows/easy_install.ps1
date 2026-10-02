@@ -257,7 +257,12 @@ function Get-MySqlTarget {
     }
     $svc = $svcs[0]
     # PathName looks like: "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysqld.exe" --defaults-file=...
-    $exePath = ($svc.PathName -replace '^"?([^"]+[\\/]mysqld\.exe)".*$', '$1')
+    # -- quoted when the exe path contains a space, but mysqld --install
+    # registers it unquoted (and with the service name appended as a
+    # trailing arg) when it doesn't, e.g. D:\a\...\bin\mysqld.exe
+    # --defaults-file=... FractalSQLCI. The closing quote is therefore
+    # optional, matched by a following whitespace instead.
+    $exePath = ($svc.PathName -replace '^"?([^"]+[\\/]mysqld\.exe)"?\s.*$', '$1')
     if (-not (Test-Path $exePath)) { Write-Die "Service '$($svc.Name)' PathName didn't resolve to a real server exe ($exePath). Pass -MysqlDir." }
     $dir = Split-Path (Split-Path $exePath -Parent) -Parent
     $script:ServiceName = $svc.Name

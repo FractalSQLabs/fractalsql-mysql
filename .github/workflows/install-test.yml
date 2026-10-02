@@ -120,7 +120,7 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -qq -y wget gnupg lsb-release ca-certificates libcurl4
+          apt-get install -qq -y wget gnupg lsb-release ca-certificates libcurl4 python3
 
           # Oracle's official apt config package. debconf's default
           # channel is the current LTS; pin mysql-8.4-lts explicitly so
@@ -386,6 +386,15 @@ jobs:
           mkdir -p /var/lib/mysql /var/log/mysql /var/run/mysqld
           chown -R mysql:mysql /var/lib/mysql /var/log/mysql /var/run/mysqld
           mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql
+
+          # Reasoning env must be in mysqld's environment before it
+          # starts (see the Debian job's comment) -- exported before
+          # the daemonize below, not after.
+          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
+          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
+          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
+          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
+
           mysqld --user=mysql --daemonize
 
           for i in $(seq 1 120); do
@@ -393,13 +402,6 @@ jobs:
               sleep 1
           done
           mysqladmin ping
-
-          # Reasoning env must be in mysqld's environment before it
-          # starts (see the Debian job's comment).
-          export FRACTALSQL_REASONING_PLUGIN=/usr/lib64/mysql/plugin/fractalsql-reasoning-http.so
-          export FRACTALSQL_HTTP_URL=http://127.0.0.1:18080/v1/chat/completions
-          export FRACTALSQL_HTTP_EMBED_URL=http://127.0.0.1:18080/v1/embeddings
-          export FRACTALSQL_HTTP_ALLOW_PLAINTEXT=1
 
           dnf install -qy ./dist/packages/fractalsql-mysql-amd64.rpm
 
