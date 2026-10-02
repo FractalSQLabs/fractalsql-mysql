@@ -120,7 +120,7 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -qq -y wget gnupg lsb-release ca-certificates
+          apt-get install -qq -y wget gnupg lsb-release ca-certificates libcurl4
 
           # Oracle's official apt config package. debconf's default
           # channel is the current LTS; pin mysql-8.4-lts explicitly so
@@ -159,7 +159,10 @@ jobs:
 
           # Install our .deb. dpkg, not apt: the server is already
           # installed, so the mysql-community-server dependency is
-          # satisfied and there is nothing left for apt to resolve.
+          # satisfied, and libcurl4 (the .deb's other declared
+          # dependency, scripts/package.sh's --depends) was installed
+          # explicitly above -- dpkg itself never resolves dependencies,
+          # so both need to already be present before this runs.
           dpkg -i ./dist/packages/fractalsql-mysql-amd64.deb
 
           # Read @@plugin_dir from the running server — must match
@@ -224,6 +227,16 @@ jobs:
               sleep 0.2
           done
 
+          # Warm-up: the TCP probe above only proves mock_llm.py's
+          # listening socket is open, not that its request-handling loop
+          # has finished starting up. The FIRST reasoning dispatch
+          # through fractalsql-reasoning-http.so pays a one-time
+          # cold-start cost (first libcurl handle init inside mysqld)
+          # that has raced the very next real call on confirmed CI runs
+          # ("reason reply: NULL" despite mock_llm.py's own log being
+          # clean). Pay it here, outside the real assertion below.
+          mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'warmup')" >/dev/null 2>&1 || true
+
           REASON=$(mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
           echo "reason reply: ${REASON:0:80}"
           echo "$REASON" | grep -qi sql \
@@ -269,7 +282,7 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -qq -y wget gnupg lsb-release ca-certificates python3
+          apt-get install -qq -y wget gnupg lsb-release ca-certificates python3 libcurl4
 
           # Same server install as debian-install above (Oracle's apt
           # repo, pinned to the 8.4 LTS channel).
@@ -445,6 +458,16 @@ jobs:
               (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1 && break
               sleep 0.2
           done
+
+          # Warm-up: the TCP probe above only proves mock_llm.py's
+          # listening socket is open, not that its request-handling loop
+          # has finished starting up. The FIRST reasoning dispatch
+          # through fractalsql-reasoning-http.so pays a one-time
+          # cold-start cost (first libcurl handle init inside mysqld)
+          # that has raced the very next real call on confirmed CI runs
+          # ("reason reply: NULL" despite mock_llm.py's own log being
+          # clean). Pay it here, outside the real assertion below.
+          mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'warmup')" >/dev/null 2>&1 || true
 
           REASON=$(mysql -N -B -e "SELECT fractal_reason(CONNECTION_ID(), 'ping')")
           echo "reason reply: ${REASON:0:80}"
@@ -828,6 +851,7 @@ jobs:
           basedir=$($root -replace '\\', '/')
           datadir=$($root -replace '\\', '/')/data
           port=3306
+          mysql_native_password=ON
           "@ | Set-Content -Path $myIni -Encoding ascii
 
           & (Join-Path $root 'bin\mysqld.exe') --defaults-file="$myIni" --initialize-insecure --console
@@ -861,9 +885,11 @@ jobs:
           #      easy_install.ps1's Invoke-MySql never passes, and the
           #      in-memory fast-path cache is wiped by the very service
           #      restart the wizard itself performs. mysql_native_password
-          #      (still enabled by default on 8.4 LTS) has no such
-          #      handshake, so the wizard's plain mysql.exe invocations
-          #      keep working across that restart.
+          #      has no such handshake, so the wizard's plain mysql.exe
+          #      invocations keep working across that restart -- but 8.4+
+          #      no longer loads that plugin unless the server config
+          #      says so, hence mysql_native_password=ON in the [mysqld]
+          #      block above.
           & $mysqlExe -h 127.0.0.1 -P 3306 -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'fractalsql-ci'; CREATE DATABASE fractalsql_ci;"
           if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: could not set root password / create database"; exit 1 }
           Get-Service FractalSQLCI

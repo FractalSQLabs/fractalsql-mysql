@@ -755,21 +755,21 @@ mysql_setup() {
   "${MYSQL[@]}" < sql/install_agents.sql >>/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
 
-  # Warm-up: the FIRST reasoning dispatch through fractalsql-reasoning-
+  # Warm-up: the first reasoning dispatch through fractalsql-reasoning-
   # http.so pays a one-time cold-start cost (first libcurl handle init
-  # inside mysqld, first DNS resolve of 127.0.0.1) that confirming the
-  # mock's listening socket is open (above) cannot see -- that only
-  # proves the socket is open, not that a full request/response round
-  # trip through mysqld's own loaded .so succeeds yet. Confirmed on real
-  # CI runs of the Windows twin (build_test.ps1): gate 04, always the
-  # FIRST reasoning-dispatch gate to run, failed with "generate dispatch
-  # failed" intermittently, on a different MySQL major each time, with
-  # mock_llm.py's own error log empty every time -- the mock server was
-  # fine, the first call into it from inside mysqld just hadn't finished
-  # warming up. Pay that cost here, outside any gate's assertion, so it
-  # can no longer race gate 04. Best-effort and silent: a real
-  # (non-timing) failure here still surfaces as gate 04's own error.
-  if [ -n "$MOCK_LLM_PID" ]; then
+  # inside mysqld, first DNS resolve of 127.0.0.1) that a listening-
+  # socket check alone can't see. Pay it here, outside any gate's
+  # assertion, so it can't race the first real dispatch. Best-effort
+  # and silent: a real (non-timing) failure still surfaces at that
+  # call site.
+  #
+  # Only runs when FRACTALSQL_REASONING_PLUGIN is still the real HTTP
+  # wrapper. Several gates swap it to a reasoning-VFS-ABI-level test
+  # fixture (tests/evil_*.c, tests/retry_reasoning_plugin.c) before
+  # calling mysql_setup, and those fixtures choose their behavior by
+  # call count since process start -- a warm-up call would consume the
+  # trigger slot the gate's own assertion needs.
+  if [ -n "$MOCK_LLM_PID" ] && [ "$FRACTALSQL_REASONING_PLUGIN" = "$PLUGDIR/fractalsql-reasoning-http.so" ]; then
     "${MYSQL[@]}" -N -e "SELECT fractal_reason(CONNECTION_ID(), 'warmup');" >/dev/null 2>&1
   fi
 
