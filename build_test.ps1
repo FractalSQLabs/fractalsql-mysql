@@ -641,6 +641,28 @@ function Mysql-Setup {
     # failed "PROCEDURE ... does not exist" even after the SONAME fix).
     Get-Content "$Here\sql\install_agents.sql" -Raw | & $script:MysqlExe --host=127.0.0.1 --port=$script:Port -uroot -D fractalsql_bt >> $setupLog 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Host "    install_agents.sql failed, see $setupLog"; return 2 }
+
+    # Warm-up: the FIRST reasoning dispatch through fractalsql-reasoning-
+    # http.dll pays a one-time cold-start cost (first libcurl/WinHTTP
+    # handle init inside mysqld, first DNS resolve of 127.0.0.1, a
+    # real-time AV scan of the newly loaded DLL's first outbound
+    # connection) that Wait-TcpPort's listening-socket check above
+    # cannot see -- it only confirms the mock's socket is open, not that
+    # a full request/response round trip through mysqld's own loaded DLL
+    # succeeds yet. Confirmed on real CI runs: gate 04, always the FIRST
+    # reasoning-dispatch gate to run, failed with "generate dispatch
+    # failed" on my26.7 in one run and on my8.4 in another, with
+    # mock_llm.py's own error log empty both times -- the mock server
+    # was fine, the first call into it from inside mysqld just hadn't
+    # finished warming up. Pay that cost here, outside any gate's
+    # assertion, so it can no longer race gate 04 specifically.
+    # Best-effort and silent: a real (non-timing) failure here still
+    # surfaces as gate 04's own clear error, same as before this existed.
+    if ($script:MockLlmProc) {
+        & $script:MysqlExe --host=127.0.0.1 --port=$script:Port -uroot -D fractalsql_bt -N `
+            -e "SELECT fractal_reason(CONNECTION_ID(), 'warmup');" > $null 2>&1
+    }
+
     return 0
 }
 

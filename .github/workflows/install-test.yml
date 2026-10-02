@@ -125,8 +125,12 @@ jobs:
           # Oracle's official apt config package. debconf's default
           # channel is the current LTS; pin mysql-8.4-lts explicitly so
           # a future mysql-apt-config default drift can't flip this cell.
+          # select-server picks the MySQL series; repo-codename is the
+          # OS codename (left to lsb-release's auto-detection) -- mixing
+          # those up makes apt treat "mysql-8.4-lts" as the Ubuntu
+          # codename and fail with "does not have a Release file".
           wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
-          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+          echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" \
               | debconf-set-selections
           dpkg -i mysql-apt-config_0.8.35-1_all.deb
           apt-get update -qq
@@ -270,7 +274,7 @@ jobs:
           # Same server install as debian-install above (Oracle's apt
           # repo, pinned to the 8.4 LTS channel).
           wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.35-1_all.deb
-          echo "mysql-apt-config mysql-apt-config/repo-codename select mysql-8.4-lts" \
+          echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" \
               | debconf-set-selections
           dpkg -i mysql-apt-config_0.8.35-1_all.deb
           apt-get update -qq

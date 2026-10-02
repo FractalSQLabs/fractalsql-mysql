@@ -754,6 +754,25 @@ mysql_setup() {
   # own docker-entrypoint-initdb.d 10-/11- ordering already accounts for.
   "${MYSQL[@]}" < sql/install_agents.sql >>/tmp/fractalsql_bt_setup_${v//./_}.log 2>&1 \
     || { cat /tmp/fractalsql_bt_setup_${v//./_}.log >&2; return 2; }
+
+  # Warm-up: the FIRST reasoning dispatch through fractalsql-reasoning-
+  # http.so pays a one-time cold-start cost (first libcurl handle init
+  # inside mysqld, first DNS resolve of 127.0.0.1) that confirming the
+  # mock's listening socket is open (above) cannot see -- that only
+  # proves the socket is open, not that a full request/response round
+  # trip through mysqld's own loaded .so succeeds yet. Confirmed on real
+  # CI runs of the Windows twin (build_test.ps1): gate 04, always the
+  # FIRST reasoning-dispatch gate to run, failed with "generate dispatch
+  # failed" intermittently, on a different MySQL major each time, with
+  # mock_llm.py's own error log empty every time -- the mock server was
+  # fine, the first call into it from inside mysqld just hadn't finished
+  # warming up. Pay that cost here, outside any gate's assertion, so it
+  # can no longer race gate 04. Best-effort and silent: a real
+  # (non-timing) failure here still surfaces as gate 04's own error.
+  if [ -n "$MOCK_LLM_PID" ]; then
+    "${MYSQL[@]}" -N -e "SELECT fractal_reason(CONNECTION_ID(), 'warmup');" >/dev/null 2>&1
+  fi
+
   return 0
 }
 
@@ -1820,7 +1839,7 @@ gate_20_analytics() {
   echo "$knn" | grep -q '"doc_id": *2' \
     && pass "20 analytics: fractal_mine_topology_negatives ranks the nearest stored vector (doc_id=2) first" \
     || fail "20 analytics: fractal_mine_topology_negatives='$knn'"
-  [ "$(echo "$knn" | grep -o '"doc_id"' | wc -l)" = "2" ] \
+  [ "$(echo "$knn" | grep -o '"doc_id"' | wc -l)" -eq 2 ] \
     && pass "20 analytics: fractal_mine_topology_negatives honors k=2 (returned exactly 2 rows)" \
     || fail "20 analytics: expected 2 result rows, got: $knn"
 
