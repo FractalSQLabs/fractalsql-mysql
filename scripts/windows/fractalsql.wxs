@@ -7,7 +7,7 @@
     -dMYSQL_MAJOR=8.4 | 9.7 | 26.7 (dotted, for display)
     -dMYSQL_MAJOR_TAG=8_4 | 9_7 | 26_7 (sanitized, for WiX IDs)
     -dSTAGE_DIR=dist\windows\staging-my...
-    -dMSI_VERSION=2.0.0
+    -dMSI_VERSION=2.0.2
   plus the standard candle -arch x64|arm64, which populates
   $(sys.BUILDARCH) and selects the Package Platform attribute.
 
