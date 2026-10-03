@@ -25,7 +25,7 @@ REM
 REM Environment
 REM   MYSQL_MAJOR   8.4 ^| 9.7 ^| 26.7: selects UpgradeCode and install-folder name
 REM   MSI_ARCH      x64 ^| arm64: passed to candle -arch
-REM   MSI_VERSION   overrides Product Version (default 2.0.0, read from src\fractalsql.c's FSQL_VERSION if not set)
+REM   MSI_VERSION   overrides Product Version (default 2.0.2, read from src\fractalsql.c's FSQL_VERSION if not set)
 
 setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 

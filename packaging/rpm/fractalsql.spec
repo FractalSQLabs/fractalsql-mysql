@@ -10,7 +10,7 @@
 # it is not exercised by any workflow in this repo.
 
 Name:           fractalsql-mysql
-Version:        2.0.0
+Version:        2.0.2
 Release:        1%{?dist}
 Summary:        FractalSQL UDF for MySQL (8.4 LTS / 9.7 LTS / 26.7)
 

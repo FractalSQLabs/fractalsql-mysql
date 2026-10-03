@@ -57,7 +57,7 @@ You should see:
 
 ```
 edition   version
-Community 2.0.0
+Community 2.0.2
 ```
 
 MySQL has no `CREATE EXTENSION` mechanism and nothing equivalent to

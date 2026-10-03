@@ -48,7 +48,7 @@ Confirm the UDF set loaded:
 ```bash
 docker compose exec mysql mysql -uroot -pfractalsql fractalsql_demo -e \
   "SELECT fractal_edition(), fractal_version();"
-# expect: Community, 2.0.0
+# expect: Community, 2.0.2
 ```
 
 Run any demo (re-runnable; each recreates its own fixture tables):

@@ -1,5 +1,5 @@
 /* src/fractalsql.c
- * fractalsql-mysql v2.0.0: Stochastic Fractal Search for MySQL (UDF).
+ * fractalsql-mysql v2.0.2: Stochastic Fractal Search for MySQL (UDF).
  *
  * Compatible with MySQL 8.4 LTS, 9.7 LTS, and 26.7.
  * The UDF ABI has been stable across these majors.
@@ -71,7 +71,7 @@
  * VERSION from this same #define via sed. Keeping both readers on one
  * #define avoids the UDF's self-reported version and the package
  * metadata's version silently drifting apart. */
-#define FSQL_VERSION "2.0.0"
+#define FSQL_VERSION "2.0.2"
 
 /* strncasecmp is POSIX (<strings.h>), not standard C. MSVC has no
  * <strings.h> at all, only the underscore-prefixed _strnicmp. Used by
